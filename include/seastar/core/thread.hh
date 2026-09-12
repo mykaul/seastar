@@ -22,21 +22,15 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
 #include <seastar/core/thread_impl.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/scheduling.hh>
 #include <memory>
-#include <setjmp.h>
-#include <type_traits>
-#include <chrono>
-#include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
+#include <seastar/util/assert.hh>
 #include <ucontext.h>
 #include <boost/intrusive/list.hpp>
-#endif
 
 /// \defgroup thread-module Seastar threads
 ///
@@ -73,7 +67,6 @@ namespace seastar {
 
 /// \addtogroup thread-module
 /// @{
-SEASTAR_MODULE_EXPORT_BEGIN
 class thread;
 class thread_attributes;
 
@@ -84,7 +77,6 @@ public:
     // For stack_size 0, a default value will be used (128KiB when writing this comment)
     size_t stack_size = 0;
 };
-SEASTAR_MODULE_EXPORT_END
 
 /// \cond internal
 extern thread_local jmp_buf_link g_unthreaded_context;
@@ -127,16 +119,15 @@ public:
     bool should_yield() const;
     void reschedule();
     void yield();
+    scheduling_group switch_to(scheduling_group new_sg);
     task* waiting_task() noexcept override { return _done.waiting_task(); }
     friend class thread;
     friend void thread_impl::switch_in(thread_context*);
     friend void thread_impl::switch_out(thread_context*);
-    friend scheduling_group thread_impl::sched_group(const thread_context*);
 };
 
 /// \endcond
 
-SEASTAR_MODULE_EXPORT
 /// \brief thread - stateful thread of execution
 ///
 /// Threads allow using seastar APIs in a blocking manner,
@@ -170,7 +161,7 @@ public:
     /// \brief Destroys a \c thread object.
     ///
     /// The thread must not represent a running thread of execution (see join()).
-    ~thread() { assert(!_context || _context->_joined); }
+    ~thread() { SEASTAR_ASSERT(!_context || _context->_joined); }
     /// \brief Waits for thread execution to terminate.
     ///
     /// Waits for thread execution to terminate, and marks the thread object as not
@@ -181,17 +172,53 @@ public:
     /// Gives other threads/fibers a chance to run on current CPU.
     /// The current thread will resume execution promptly.
     static void yield();
+    /// \brief Switch the current thread to a different scheduling group.
+    ///
+    /// Moves the currently running thread to \c new_sg: subsequent execution
+    /// of this thread (including the remainder of the calling function) is
+    /// accounted for, and scheduled as, \c new_sg instead of whatever group
+    /// the thread was created or last switched into.
+    ///
+    /// If \c new_sg is already the thread's current scheduling group, this
+    /// call is a no-op: it returns immediately without yielding. Otherwise,
+    /// it is equivalent to \ref yield() into the new group: other
+    /// threads/fibers get a chance to run before this thread resumes.
+    ///
+    /// This is the \ref thread counterpart of \ref coroutine::switch_to,
+    /// which does the same for coroutines.
+    ///
+    /// \param new_sg the scheduling group to switch to
+    /// \return the scheduling group the thread was in before the switch, so
+    ///         the caller can switch back later if desired.
+    ///
+    /// Example:
+    /// \code
+    ///    seastar::thread th([sg] {
+    ///        ... // do some preliminary work
+    ///        auto prev_sg = seastar::thread::switch_to(sg);
+    ///        ... // do some work accounted to sg
+    ///        seastar::thread::switch_to(prev_sg);
+    ///        ... // do some more work
+    ///    });
+    /// \endcode
+    static scheduling_group switch_to(scheduling_group new_sg);
     /// \brief Checks whether this thread ought to call yield() now.
     ///
     /// Useful where we cannot call yield() immediately because we
     /// Need to take some cleanup action first.
-    static bool should_yield();
+    static bool should_yield() {
+        return need_preempt();
+    }
 
     /// \brief Yield if this thread ought to call yield() now.
     ///
     /// Useful where a code does long running computation and does
     /// not want to hog cpu for more then its share
-    static void maybe_yield();
+    static void maybe_yield() {
+        if (should_yield()) [[unlikely]] {
+            yield();
+        }
+    }
 
     static bool running_in_thread() {
         return thread_impl::get() != nullptr;
@@ -217,7 +244,6 @@ thread::join() {
     return _context->_done.get_future();
 }
 
-SEASTAR_MODULE_EXPORT_BEGIN
 /// Executes a callable in a seastar thread.
 ///
 /// Runs a block of code in a threaded context,
@@ -286,5 +312,4 @@ async(Func&& func, Args&&... args) noexcept {
 }
 /// @}
 
-SEASTAR_MODULE_EXPORT_END
 }

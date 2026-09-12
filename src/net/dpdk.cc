@@ -20,12 +20,7 @@
  */
 #ifdef SEASTAR_HAVE_DPDK
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#include <cinttypes>
-#include <atomic>
 #include <vector>
 #include <queue>
 #include <getopt.h>
@@ -43,9 +38,6 @@ module;
 
 #include <boost/preprocessor.hpp>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/posix.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/net/virtio-interface.hh>
@@ -55,6 +47,9 @@ module seastar;
 #include <seastar/core/sstring.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/internal/poll.hh>
+#include <seastar/core/units.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/function_input_iterator.hh>
 #include <seastar/util/transform_iterator.hh>
 #include <seastar/util/std-compat.hh>
@@ -65,7 +60,6 @@ module seastar;
 #include <seastar/net/toeplitz.hh>
 #include <seastar/net/native-stack.hh>
 #include "core/vla.hh"
-#endif
 
 #if RTE_VERSION <= RTE_VERSION_NUM(2,0,0,16)
 
@@ -125,8 +119,8 @@ namespace dpdk {
 /******************* Net device related constatns *****************************/
 static constexpr uint16_t default_ring_size      = 512;
 
-// 
-// We need 2 times the ring size of buffers because of the way PMDs 
+//
+// We need 2 times the ring size of buffers because of the way PMDs
 // refill the ring.
 //
 static constexpr uint16_t mbufs_per_queue_rx     = 2 * default_ring_size;
@@ -290,7 +284,7 @@ public:
 
     void update_xstats() {
         auto len = rte_eth_xstats_get(_port_id, _xstats, _len);
-        assert(len == _len);
+        SEASTAR_ASSERT(len == _len);
     }
 
     uint64_t get_value(const xstat_id id) {
@@ -327,7 +321,7 @@ private:
 
     void update_xstat_names() {
         auto len = rte_eth_xstats_get_names(_port_id, _xstat_names, _len);
-        assert(len == _len);
+        SEASTAR_ASSERT(len == _len);
     }
 
     void update_offsets() {
@@ -351,7 +345,6 @@ class dpdk_device : public device {
     rss_key_type _rss_key;
     port_stats _stats;
     timer<> _stats_collector;
-    const std::string _stats_plugin_name;
     const std::string _stats_plugin_inst;
     seastar::metrics::metric_groups _metrics;
     bool _is_i40e_device = false;
@@ -410,7 +403,6 @@ public:
         , _home_cpu(this_shard_id())
         , _use_lro(use_lro)
         , _enable_fc(enable_fc)
-        , _stats_plugin_name("network")
         , _stats_plugin_inst(std::string("port") + std::to_string(_port_idx))
         , _xstats(port_idx)
     {
@@ -423,7 +415,7 @@ public:
 
         // Register port statistics pollers
         namespace sm = seastar::metrics;
-        _metrics.add_group(_stats_plugin_name, {
+        _metrics.add_group("network", {
             // Rx Good
             sm::make_counter("rx_multicast", _stats.rx.good.mcast,
                             sm::description("Counts a number of received multicast packets."), {sm::shard_label(_stats_plugin_inst)}),
@@ -506,7 +498,7 @@ public:
     virtual future<> link_ready() override { return _link_ready_promise.get_future(); }
     virtual std::unique_ptr<qp> init_local_queue(const program_options::option_group& opts, uint16_t qid) override;
     virtual unsigned hash2qid(uint32_t hash) override {
-        assert(_redir_table.size());
+        SEASTAR_ASSERT(_redir_table.size());
         return _redir_table[hash & (_redir_table.size() - 1)];
     }
     uint16_t port_idx() { return _port_idx; }
@@ -552,7 +544,7 @@ class dpdk_qp : public net::qp {
             // For a TSO case each MSS window should not include more than 8
             // fragments including headers.
             //
-            
+
             // Calculate the number of frags containing headers.
             //
             // Note: we support neither VLAN nor tunneling thus headers size
@@ -642,7 +634,7 @@ class dpdk_qp : public net::qp {
                     head->l3_len = oi.ip_hdr_len;
 
                     if (oi.tso_seg_size) {
-                        assert(oi.needs_ip_csum);
+                        SEASTAR_ASSERT(oi.needs_ip_csum);
                         head->ol_flags |= RTE_MBUF_F_TX_TCP_SEG;
                         head->l4_len = oi.tcp_hdr_len;
                         head->tso_segsz = oi.tso_seg_size;
@@ -774,7 +766,7 @@ build_mbuf_cluster:
                     cur_seg_offset = 0;
 
                     // FIXME: assert in a fast-path - remove!!!
-                    assert(cur_seg);
+                    SEASTAR_ASSERT(cur_seg);
                 }
             }
         }
@@ -859,8 +851,8 @@ build_mbuf_cluster:
 
             rte_mbuf* m;
 
-            // TODO: assert() in a fast path! Remove me ASAP!
-            assert(frag.size);
+            // TODO: SEASTAR_ASSERT() in a fast path! Remove me ASAP!
+            SEASTAR_ASSERT(frag.size);
 
             // Create a HEAD of mbufs' cluster and set the first bytes into it
             len = do_one_buf(qp, head, base, left_to_set);
@@ -950,7 +942,7 @@ build_mbuf_cluster:
          */
         static size_t set_one_data_buf(
             dpdk_qp& qp, rte_mbuf*& m, char* va, size_t buf_len) {
-            static constexpr size_t max_frag_len = 15 * 1024; // 15K
+            static constexpr size_t max_frag_len = 15_KiB;
 
             //
             // Currently we break a buffer on a 15K boundary because 82599
@@ -1247,8 +1239,7 @@ build_mbuf_cluster:
     };
 
 public:
-    explicit dpdk_qp(dpdk_device* dev, uint16_t qid,
-                     const std::string stats_plugin_name);
+    explicit dpdk_qp(dpdk_device* dev, uint16_t qid, std::string port_name);
 
     virtual void rx_start() override;
     virtual future<> send(packet p) override {
@@ -1278,8 +1269,8 @@ private:
     uint32_t _send(circular_buffer<packet>& pb, Func packet_to_tx_buf_p) {
         if (_tx_burst.size() == 0) {
             for (auto&& p : pb) {
-                // TODO: assert() in a fast path! Remove me ASAP!
-                assert(p.len());
+                // TODO: SEASTAR_ASSERT() in a fast path! Remove me ASAP!
+                SEASTAR_ASSERT(p.len());
 
                 tx_buf* buf = packet_to_tx_buf_p(std::move(p));
                 if (!buf) {
@@ -1422,11 +1413,11 @@ private:
     std::vector<fragment> _frags;
     std::vector<char*> _bufs;
     size_t _num_rx_free_segs = 0;
-    reactor::poller _rx_gc_poller;
+    internal::poller _rx_gc_poller;
     std::unique_ptr<void, free_deleter> _rx_xmem;
     tx_buf_factory _tx_buf_factory;
     std::optional<reactor::poller> _rx_poller;
-    reactor::poller _tx_gc_poller;
+    internal::poller _tx_gc_poller;
     std::vector<rte_mbuf*> _tx_burst;
     uint16_t _tx_burst_idx = 0;
     static constexpr phys_addr_t page_mask = ~(memory::page_size - 1);
@@ -1434,7 +1425,7 @@ private:
 
 int dpdk_device::init_port_start()
 {
-    assert(_port_idx < rte_eth_dev_count_avail());
+    SEASTAR_ASSERT(_port_idx < rte_eth_dev_count_avail());
 
     rte_eth_dev_info_get(_port_idx, &_dev_info);
 
@@ -1512,7 +1503,7 @@ int dpdk_device::init_port_start()
     // Set RSS mode: enable RSS if seastar is configured with more than 1 CPU.
     // Even if port has a single queue we still want the RSS feature to be
     // available in order to make HW calculate RSS hash for us.
-    if (smp::count > 1) {
+    if (this_smp_shard_count() > 1) {
         if (_dev_info.hash_key_size == 40) {
             _rss_key = default_rsskey_40bytes;
         } else if (_dev_info.hash_key_size == 52) {
@@ -1541,7 +1532,7 @@ int dpdk_device::init_port_start()
     if (_num_queues > 1) {
         if (_dev_info.reta_size) {
             // RETA size should be a power of 2
-            assert((_dev_info.reta_size & (_dev_info.reta_size - 1)) == 0);
+            SEASTAR_ASSERT((_dev_info.reta_size & (_dev_info.reta_size - 1)) == 0);
 
             // Set the RSS table to the correct size
             _redir_table.resize(_dev_info.reta_size);
@@ -1574,7 +1565,7 @@ int dpdk_device::init_port_start()
     // all together. If this assumption breaks we need to rework the below logic
     // by splitting the csum offload feature bit into separate bits for IPv4,
     // TCP and UDP.
-    assert(((_dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM) &&
+    SEASTAR_ASSERT(((_dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM) &&
             (_dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_UDP_CKSUM) &&
             (_dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_TCP_CKSUM)) ||
            (!(_dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM) &&
@@ -1613,7 +1604,7 @@ int dpdk_device::init_port_start()
     // or not set all together. If this assumption breaks we need to rework the
     // below logic by splitting the csum offload feature bit into separate bits
     // for TCP and UDP.
-    assert(((_dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) &&
+    SEASTAR_ASSERT(((_dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) &&
             (_dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) ||
            (!(_dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) &&
             !(_dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)));
@@ -1828,7 +1819,7 @@ bool dpdk_qp<HugetlbfsMemBackend>::init_rx_mbuf_pool()
         //
         for (int i = 0; i < mbufs_per_queue_rx; i++) {
             rte_mbuf* m = rte_pktmbuf_alloc(_pktmbuf_pool_rx);
-            assert(m);
+            SEASTAR_ASSERT(m);
             _rx_free_bufs.push_back(m);
         }
 
@@ -1914,9 +1905,8 @@ void dpdk_device::check_port_link_status()
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 
 template <bool HugetlbfsMemBackend>
-dpdk_qp<HugetlbfsMemBackend>::dpdk_qp(dpdk_device* dev, uint16_t qid,
-                                      const std::string stats_plugin_name)
-     : qp(true, stats_plugin_name, qid), _dev(dev), _qid(qid),
+dpdk_qp<HugetlbfsMemBackend>::dpdk_qp(dpdk_device* dev, uint16_t qid, std::string port_name)
+     : qp(true, port_name, qid), _dev(dev), _qid(qid),
        _rx_gc_poller(reactor::poller::simple([&] { return rx_gc(); })),
        _tx_buf_factory(qid),
        _tx_gc_poller(reactor::poller::simple([&] { return _tx_buf_factory.gc(); }))
@@ -1952,18 +1942,23 @@ dpdk_qp<HugetlbfsMemBackend>::dpdk_qp(dpdk_device* dev, uint16_t qid,
 
     // Register error statistics: Rx total and checksum errors
     namespace sm = seastar::metrics;
-    _metrics.add_group(_stats_plugin_name, {
-        sm::make_counter(_queue_name + "_rx_csum_errors", _stats.rx.bad.csum,
-                        sm::description("Counts a number of packets received by this queue that have a bad CSUM value. "
-                                        "A non-zero value of this metric usually indicates a HW issue, e.g. a bad cable.")),
+    std::vector<sm::label_instance> labels = {sm::label("queue")(_queue_name)};
+    if (!port_name.empty()) {
+        labels.push_back(sm::label("port")(port_name));
+    }
+    _metrics.add_group("network", {
+        sm::make_counter("rx_csum_errors_total", _stats.rx.bad.csum,
+                        sm::description("Counts a number of packets received per queue that have a bad CSUM value. "
+                                        "A non-zero value of this metric usually indicates a HW issue, e.g. a bad cable."), labels),
 
-        sm::make_counter(_queue_name + "_rx_errors", _stats.rx.bad.total,
-                        sm::description("Counts a total number of errors in the ingress path for this queue: CSUM errors, etc.")),
+        sm::make_counter("rx_errors_total", _stats.rx.bad.total,
+                        sm::description("Counts a total number of errors in the ingress path per queue: CSUM errors, etc."), labels),
 
-        sm::make_counter(_queue_name + "_rx_no_memory_errors", _stats.rx.bad.no_mem,
-                        sm::description("Counts a number of ingress packets received by this HW queue but dropped by the SW due to low memory. "
-                                        "A non-zero value indicates that seastar doesn't have enough memory to handle the packet reception or the memory is too fragmented.")),
+        sm::make_counter("rx_no_memory_errors_total", _stats.rx.bad.no_mem,
+                        sm::description("Counts a number of ingress packets received per queue but dropped by the SW due to low memory. "
+                                        "A non-zero value indicates that seastar doesn't have enough memory to handle the packet reception or the memory is too fragmented."), labels),
     });
+
 }
 
 #pragma GCC diagnostic pop
@@ -2117,14 +2112,14 @@ bool dpdk_qp<HugetlbfsMemBackend>::rx_gc()
                                  (void **)_rx_free_bufs.data(),
                                  _rx_free_bufs.size());
 
-            // TODO: assert() in a fast path! Remove me ASAP!
-            assert(_num_rx_free_segs >= _rx_free_bufs.size());
+            // TODO: SEASTAR_ASSERT() in a fast path! Remove me ASAP!
+            SEASTAR_ASSERT(_num_rx_free_segs >= _rx_free_bufs.size());
 
             _num_rx_free_segs -= _rx_free_bufs.size();
             _rx_free_bufs.clear();
 
-            // TODO: assert() in a fast path! Remove me ASAP!
-            assert((_rx_free_pkts.empty() && !_num_rx_free_segs) ||
+            // TODO: SEASTAR_ASSERT() in a fast path! Remove me ASAP!
+            SEASTAR_ASSERT((_rx_free_pkts.empty() && !_num_rx_free_segs) ||
                    (!_rx_free_pkts.empty() && _num_rx_free_segs));
         }
     }
@@ -2237,15 +2232,13 @@ void dpdk_device::set_rss_table()
 
 std::unique_ptr<qp> dpdk_device::init_local_queue(const program_options::option_group& opts, uint16_t qid) {
     auto net_opts = dynamic_cast<const net::native_stack_options*>(&opts);
-    assert(net_opts);
+    SEASTAR_ASSERT(net_opts);
 
     std::unique_ptr<qp> qp;
     if (net_opts->_hugepages) {
-        qp = std::make_unique<dpdk_qp<true>>(this, qid,
-                                 _stats_plugin_name + "-" + _stats_plugin_inst);
+        qp = std::make_unique<dpdk_qp<true>>(this, qid, _stats_plugin_inst);
     } else {
-        qp = std::make_unique<dpdk_qp<false>>(this, qid,
-                                 _stats_plugin_name + "-" + _stats_plugin_inst);
+        qp = std::make_unique<dpdk_qp<false>>(this, qid, _stats_plugin_inst);
     }
 
     // FIXME: future is discarded
@@ -2268,8 +2261,8 @@ std::unique_ptr<net::device> create_dpdk_net_device(
 {
     static bool called = false;
 
-    assert(!called);
-    assert(dpdk::eal::initialized);
+    SEASTAR_ASSERT(!called);
+    SEASTAR_ASSERT(dpdk::eal::initialized);
 
     called = true;
 
@@ -2287,22 +2280,15 @@ std::unique_ptr<net::device> create_dpdk_net_device(
 std::unique_ptr<net::device> create_dpdk_net_device(
                                     const hw_config& hw_cfg)
 {
-    return create_dpdk_net_device(*hw_cfg.port_index, smp::count, hw_cfg.lro, hw_cfg.hw_fc);
+    return create_dpdk_net_device(*hw_cfg.port_index, this_smp_shard_count(), hw_cfg.lro, hw_cfg.hw_fc);
 }
 
 }
 
 #else
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/net/dpdk.hh>
-#endif
 
 #endif // SEASTAR_HAVE_DPDK
 

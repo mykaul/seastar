@@ -21,43 +21,70 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
+#include <array>
+#include <chrono>
 #include <boost/intrusive/list.hpp>
-#endif
 #include <seastar/net/api.hh>
+#include <seastar/http/common.hh>
+#include <seastar/http/connection_factory.hh>
 #include <seastar/http/reply.hh>
+#include <seastar/http/retry_strategy.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/iostream.hh>
-#include <seastar/util/modules.hh>
+#include <seastar/util/integrated-length.hh>
 
 namespace bi = boost::intrusive;
 
 namespace seastar {
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 namespace tls { class certificate_credentials; }
 
 namespace http {
 
-namespace experimental { class client; }
+class client;
 struct request;
 struct reply;
+
+/**
+ * \brief Per-HTTP-method I/O statistics
+ *
+ * Counters are accumulated for the lifetime of the owning \ref client and
+ * cover all requests of a single \ref httpd::operation_type.
+ */
+struct http_method_stats {
+    /// Number of completed requests (both successful and failed)
+    uint64_t ops = 0;
+    /// Number of retry attempts performed across all requests
+    uint64_t retries = 0;
+    /// Cumulative request latency; divide by \ref ops to get the average
+    std::chrono::duration<double> latency{0};
+};
+
+/**
+ * \brief Per-method HTTP client statistics, indexed by \ref httpd::operation_type
+ */
+class client_stats {
+    static constexpr size_t num_methods = httpd::operation_type::NUM_OPERATION;
+    std::array<http_method_stats, num_methods> methods{};
+public:
+    http_method_stats& operator[](httpd::operation_type method) { return methods[method]; }
+
+    const http_method_stats& operator[](httpd::operation_type method) const { return methods[method]; }
+};
 
 namespace internal {
 
 class client_ref {
-    http::experimental::client* _c;
+    http::client* _c;
 public:
-    client_ref(http::experimental::client* c) noexcept;
+    client_ref(http::client* c) noexcept;
     ~client_ref();
     client_ref(client_ref&& o) noexcept : _c(std::exchange(o._c, nullptr)) {}
     client_ref(const client_ref&) = delete;
 };
 
 }
-
-namespace experimental {
 
 /**
  * \brief Class connection represents an HTTP connection over a given transport
@@ -123,35 +150,16 @@ public:
      * Connection must be closed regardless of whether there was an exception making the
      * request or not
      */
-    future<> close();
+    future<> close() noexcept;
 
 private:
-    future<reply_ptr> do_make_request(request rq);
-    void setup_request(request& rq);
+    future<reply_ptr> do_make_request(const request& rq);
     future<> send_request_head(const request& rq);
     future<reply_ptr> maybe_wait_for_continue(const request& req);
     future<> write_body(const request& rq);
     future<reply_ptr> recv_reply();
-};
 
-/**
- * \brief Factory that provides transport for \ref client
- *
- * This customization point allows callers provide its own transport for client. The
- * client code calls factory when it needs more connections to the server and maintains
- * the pool of re-usable sockets internally
- */
-
-class connection_factory {
-public:
-    /**
-     * \brief Make a \ref connected_socket
-     *
-     * The implementations of this method should return ready-to-use socket that will
-     * be used by \ref client as transport for its http connections
-     */
-    virtual future<connected_socket> make() = 0;
-    virtual ~connection_factory() {}
+    void shutdown() noexcept;
 };
 
 /**
@@ -166,29 +174,53 @@ public:
  */
 
 class client {
+public:
+    using reply_handler = noncopyable_function<future<>(const reply&, input_stream<char>&& body)>;
+    using retry_requests = bool_class<struct retry_requests_tag>;
+
+private:
     friend class http::internal::client_ref;
     using connections_list_t = bi::list<connection, bi::member_hook<connection, typename connection::hook_t, &connection::_hook>, bi::constant_time_size<false>>;
     static constexpr unsigned default_max_connections = 100;
+    static constexpr size_t default_max_bytes_to_drain = 128 * 1024;
 
     std::unique_ptr<connection_factory> _new_connections;
     unsigned _nr_connections = 0;
     unsigned _max_connections;
+    size_t _max_bytes_to_drain;
     unsigned long _total_new_connections = 0;
+    std::unique_ptr<retry_strategy> _retry_strategy;
     condition_variable _wait_con;
+    util::integrated_length<unsigned, lowres_clock, std::chrono::microseconds> _requests_queued;
     connections_list_t _pool;
+    http::client_stats _http_stats;
 
     using connection_ptr = seastar::shared_ptr<connection>;
 
-    future<connection_ptr> get_connection();
+    future<connection_ptr> get_connection(abort_source* as);
+    future<connection_ptr> make_connection(abort_source* as);
     future<> put_connection(connection_ptr con);
     future<> shrink_connections();
 
+    template <std::invocable<connection&> Fn>
+    auto with_connection(Fn&& fn, abort_source*);
+
     template <typename Fn>
-    SEASTAR_CONCEPT( requires std::invocable<Fn, connection&> )
-    auto with_connection(Fn&& fn);
+    requires std::invocable<Fn, connection&>
+    auto with_new_connection(Fn&& fn, abort_source*);
+
+    future<> maybe_retry_request(std::exception_ptr ex,
+                                 unsigned retry_count,
+                                 httpd::operation_type method,
+                                 const request& req,
+                                 reply_handler& handle,
+                                 const retry_strategy& strategy,
+                                 std::optional<reply::status_type> expected,
+                                 abort_source* as);
+
+    future<> do_make_request(connection& con, const request& req, reply_handler& handle, abort_source*, std::optional<reply::status_type> expected);
 
 public:
-    using reply_handler = noncopyable_function<future<>(const reply&, input_stream<char>&& body)>;
     /**
      * \brief Construct a simple client
      *
@@ -221,24 +253,102 @@ public:
      * may re-use the sockets on its own
      *
      * \param f -- the factory pointer
+     * \param max_connections -- maximum number of connection a client is allowed to maintain
+     * (both active and cached in pool)
+     * \param retry_strategy -- optional custom logic for retrying failed requests
      *
+     * The client uses connections provided by factory to send requests over and receive responses
+     * back. Once request-response cycle is over the connection used for that is kept by a client
+     * in a "pool". Making another http request may then pick up the existing connection from the
+     * pool thus avoiding the extra latency of establishing new connection. Pool may thus accumulate
+     * more than one connection if user sends several requests in parallel.
+     *
+     * HTTP servers may sometimes want to terminate the connections it keeps. This can happen in
+     * one of several ways.
+     *
+     * The "gentle" way is when server adds the "connection: close" header to its response. In that
+     * case client would handle the response and will just close the connection without putting it
+     * to pool.
+     *
+     * Less gentle way a server may terminate a connection is by closing it, so the underlying TCP
+     * stack would communicate regular TCP FIN-s. If the connection happens to be in pool when it
+     * happens the client would just clean the connection from pool in the background.
+     *
+     * Sometimes the least gentle closing occurs when server closes the connection on the fly and
+     * TCP starts communicating FIN-s in parallel with client using it. In that case, user would
+     * receive exception from the \ref make_request() call and will have to do something about it.
+     * Client provides a transparent way of handling it called "retry".
+     *
+     * When enabled, it makes client catch the transport error, close the broken connection, open
+     * another one and retry the very same request one more time over this new connection. If the
+     * second attempt fails, this error is reported back to user.
      */
-    explicit client(std::unique_ptr<connection_factory> f, unsigned max_connections = default_max_connections);
+    explicit client(std::unique_ptr<connection_factory> f, unsigned max_connections = default_max_connections, retry_requests retry = retry_requests::no, size_t max_bytes_to_drain = default_max_bytes_to_drain);
+    client(std::unique_ptr<connection_factory> f, unsigned max_connections, size_t max_bytes_to_drain, std::unique_ptr<retry_strategy>&& retry_strategy);
 
     /**
      * \brief Send the request and handle the response
      *
      * Sends the provided request to the server and calls the provided callback to handle
-     * the response when it arrives. If the reply's status code is not equals the expected
-     * value, the handler is not called and the method resolves with exceptional future.
-     * Otherwise returns the handler's future
+     * the response when it arrives. If the expected status is specified and the response's
+     * status is not the expected one, the handler is not called and the method resolves
+     * with exceptional future. Otherwise returns the handler's future
      *
      * \param req -- request to be sent
      * \param handle -- the response handler
-     * \param expected -- the expected reply status code
+     * \param expected -- the optional expected reply status code, default is std::nullopt
+     * \param as -- abort source that aborts the request
      *
+     * Note that the handle callback should be prepared to be called more than once, because
+     * client may restart the whole request processing in case server closes the connection
+     * in the middle of operation
      */
-    future<> make_request(request req, reply_handler handle, reply::status_type expected = reply::status_type::ok);
+    future<> make_request(request&& req, reply_handler&& handle, std::optional<reply::status_type>&& expected = std::nullopt, abort_source* as = nullptr);
+
+    /**
+     * \brief Send the request and handle the response with retry strategy
+     *
+     * Same as \ref make_request()
+     * The retry strategy defines how the client should behave in case of transient failures.
+     *
+     * \param req -- request to be sent
+     * \param handle -- the response handler
+     * \param strategy -- retry strategy to apply on transient failures
+     * \param expected -- the optional expected reply status code, default is std::nullopt
+     * \param as -- abort source that aborts the request
+     *
+     * Note that the handle callback should be prepared to be called more than once, because
+     * client may restart the whole request processing in case server closes the connection
+     * in the middle of operation
+     */
+    future<> make_request(request&& req, reply_handler&& handle, const retry_strategy& strategy, std::optional<reply::status_type>&& expected = std::nullopt, abort_source* as = nullptr);
+
+    /**
+     * \brief Send the request and handle the response (abortable), same as \ref make_request()
+     *
+     *  @attention Note that the method does not take the ownership of the
+     * `request and the `handle`, it caller's responsibility the make sure they
+     * are referencing valid instances
+     */
+    future<> make_request(const request& req, reply_handler& handle, std::optional<reply::status_type> expected = std::nullopt, abort_source* as = nullptr);
+
+    /**
+     * \brief Send the request and handle the response with retry strategy (abortable), same as \ref make_request()
+     *
+     * Same as \ref make_request()
+     * The retry strategy defines how the client should behave in case of transient failures.
+     *
+     * \param req -- request to be sent (non-owning reference)
+     * \param handle -- the response handler (non-owning reference)
+     * \param strategy -- retry strategy to apply on transient failures
+     * \param expected -- the optional expected reply status code, default is std::nullopt
+     * \param as -- abort source that aborts the request
+     *
+     * @attention Note that the method does not take the ownership of the
+     * `request` and the `handle`, it is the caller's responsibility to ensure they
+     * are referencing valid instances
+     */
+    future<> make_request(const request& req, reply_handler& handle, const retry_strategy& strategy, std::optional<reply::status_type> expected = std::nullopt, abort_source* as = nullptr);
 
     /**
      * \brief Updates the maximum number of connections a client may have
@@ -255,7 +365,7 @@ public:
      *
      * Client must be closed before destruction unconditionally
      */
-    future<> close();
+    future<> close() noexcept;
 
     /**
      * \brief Returns the total number of connections
@@ -283,11 +393,31 @@ public:
     unsigned long total_new_connections_nr() const noexcept {
         return _total_new_connections;
     }
-};
 
-} // experimental namespace
+    /**
+     * \brief Returns the integrated_length<> for the number of requests waiting for connection
+     *
+     * The caller may choose to
+     * - export the immediate .value() as GAUGE metrics or
+     * - export the .integral() value as COUNTER metrics
+     *
+     * The latter option is preferred, when rate()-d it provides an average over scrape time
+     * value of the queue length.
+     */
+    const auto& integrated_requests_queued() const noexcept {
+        return _requests_queued;
+    }
+
+    /**
+     * \brief Returns the per-method HTTP statistics
+     *
+     * This is a container holding per-method I/O statistics indexed by operation type.
+     */
+    const http::client_stats& get_stats() const noexcept {
+        return _http_stats;
+    }
+};
 
 } // http namespace
 
-SEASTAR_MODULE_EXPORT_END
 } // seastar namespace

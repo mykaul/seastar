@@ -25,8 +25,11 @@
 #include <seastar/testing/random.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/later.hh>
 #include <seastar/util/shared_token_bucket.hh>
+
+using namespace seastar;
 
 // The test allows measuring if the shared_token_bucket<> allows the tokens
 // consumers to get tokens at the rate the bucket is configured with.
@@ -125,10 +128,10 @@ struct worker : public seastar::peering_sharded_service<worker<TokenBucket>> {
 
     worker(TokenBucket& tb_) noexcept
         : tb(tb_)
-        , release_per_tick(double(tb.rate()) / smp::count * std::chrono::duration_cast<std::chrono::duration<double>>(release_period).count())
+        , release_per_tick(double(tb.rate()) / this_smp_shard_count() * std::chrono::duration_cast<std::chrono::duration<double>>(release_period).count())
         , last_release(clock_type::now())
         , release_tokens([this] { do_release(); })
-        , threshold(tb.limit() / smp::count)
+        , threshold(tb.limit() / this_smp_shard_count())
         , size(1, std::min<int>(threshold, 128))
     {
         release_tokens.arm_periodic(std::chrono::duration_cast<std::chrono::microseconds>(release_period));
@@ -155,7 +158,7 @@ struct worker : public seastar::peering_sharded_service<worker<TokenBucket>> {
     }
 
     future<work_result> work(std::function<future<>(std::chrono::duration<double> d)> do_sleep) {
-        assert(tokens == 0);
+        SEASTAR_ASSERT(tokens == 0);
         auto start = clock_type::now();
         // Run for 1 second. The perf suite would restart this method several times
         return do_until([end = start + std::chrono::seconds(1)] { return clock_type::now() >= end; },
@@ -201,12 +204,12 @@ struct worker : public seastar::peering_sharded_service<worker<TokenBucket>> {
             //  - shard-id
             //  - total number of tokens and total time taken
             //  - effective speed
-            //  - expected speed (token-bucket.rate() / smp::count)
+            //  - expected speed (token-bucket.rate() / this_smp_shard_count())
             //  - ticks -- the number of times the worker had change to grab tokens
             //  - the info about tokens releasing
             auto delay = std::chrono::duration_cast<std::chrono::duration<double>>(clock_type::now() - start).count();
             fmt::print("{} {}t/{:.3f}s, speed is {:.1f}t/s goal {:.1f}t/s, {} ticks, released {} (accumulated {})\n", this_shard_id(), tokens, delay,
-                    double(tokens) / delay, double(tb.rate()) / smp::count, ticks.size(), released, available);
+                    double(tokens) / delay, double(tb.rate()) / this_smp_shard_count(), ticks.size(), released, available);
             do_release(available);
             work_result r {
                 .tokens = std::exchange(this->tokens, 0),
@@ -243,7 +246,7 @@ struct worker : public seastar::peering_sharded_service<worker<TokenBucket>> {
             p = td.delay;
         }
         ticks.clear();
-        if (this_shard_id() == smp::count - 1) {
+        if (this_shard_id() == this_smp_shard_count() - 1) {
             return make_ready_future<>();
         }
 
@@ -267,7 +270,7 @@ struct hog {
     {}
 
     void work() {
-        assert(!stopped.has_value());
+        SEASTAR_ASSERT(!stopped.has_value());
         keep_going = true;
         stopped = do_until([this] { return !keep_going; },
             [this] {
@@ -283,7 +286,7 @@ struct hog {
     }
 
     future<> terminate() {
-        assert(stopped.has_value());
+        SEASTAR_ASSERT(stopped.has_value());
         keep_going = false;
         auto f = std::move(*stopped);
         stopped.reset();

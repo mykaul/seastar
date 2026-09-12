@@ -21,22 +21,17 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
+#include <concepts>
 #include <functional>
 #include <limits>
 #include <map>
 #include <type_traits>
 #include <variant>
 #include <fmt/format.h>
-#endif
-#include "future.hh"
 #include <seastar/core/sstring.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/metrics_types.hh>
-#include <seastar/util/std-compat.hh>
 #include <seastar/util/bool_class.hh>
-#include <seastar/util/modules.hh>
 
 /*! \file metrics.hh
  *  \brief header for metrics creation.
@@ -98,7 +93,6 @@ namespace seastar {
 
 namespace metrics {
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 class double_registration : public std::runtime_error {
 public:
@@ -250,7 +244,6 @@ public:
         return key;
     }
 };
-SEASTAR_MODULE_EXPORT_END
 
 /*!
  * \namespace impl
@@ -260,6 +253,41 @@ SEASTAR_MODULE_EXPORT_END
  * Some of the implementation details need to be in the header file, they should not be use directly.
  */
 namespace impl {
+
+// A escaped label value.
+//
+// This is "just" as a string, with the additional invariant that it has already been
+// escaped, and this type preserves that invariant.
+class escaped_string {
+    sstring _value;
+
+public:
+    escaped_string() = default;
+    escaped_string(const escaped_string&) = default;
+    escaped_string(escaped_string&&) = default;
+
+    // this constructor escapes the input if necessary
+    explicit escaped_string(sstring v);
+
+    const sstring& value() const {
+        return _value;
+    }
+
+    operator const sstring&() const {
+        return value();
+    }
+
+    bool operator==(const escaped_string& o) const = default;
+    auto operator<=>(const escaped_string& o) const = default;
+
+    escaped_string& operator=(const escaped_string&) = default;
+    escaped_string& operator=(escaped_string&&) = default;
+
+    // assignment from an unescaped string escapes it if necessary
+    escaped_string& operator=(const sstring&);
+};
+
+using labels_type = std::map<sstring, escaped_string>;
 
 // The value binding data types
 enum class data_type : uint8_t {
@@ -341,12 +369,12 @@ public:
             : u(d), _type(t) {
     }
 
-    metric_value& operator+=(const metric_value& c) {
-        *this = *this + c;
-        return *this;
+    metric_value& operator+=(const metric_value& c);
+
+    metric_value operator+(const metric_value& c) {
+        return metric_value(*this) += c;
     }
 
-    metric_value operator+(const metric_value& c);
     const histogram& get_histogram() const {
         return std::get<histogram>(u);
     }
@@ -380,7 +408,7 @@ struct metric_definition_impl {
     bool enabled = true;
     skip_when_empty _skip_when_empty = skip_when_empty::no;
     std::vector<std::string> aggregate_labels;
-    std::map<sstring, sstring> labels;
+    labels_type labels;
     metric_definition_impl& operator ()(bool enabled);
     metric_definition_impl& operator ()(const label_instance& label);
     metric_definition_impl& operator ()(skip_when_empty skip) noexcept;
@@ -407,16 +435,16 @@ public:
     virtual metric_groups_def& add_group(group_name_type name, const std::vector<metric_definition>& l) = 0;
 };
 
-instance_id_type shard();
+escaped_string shard();
 
-template<typename T, typename = std::enable_if_t<std::is_invocable_v<T>>>
+template<std::invocable T>
 metric_function make_function(T val, data_type dt) {
     return [dt, val = std::move(val)] {
         return metric_value(val(), dt);
     };
 }
 
-template<typename T, typename = std::enable_if_t<!std::is_invocable_v<T>>>
+template<typename T>
 metric_function make_function(T& val, data_type dt) {
     return [dt, &val] {
         return metric_value(val, dt);
@@ -442,7 +470,7 @@ extern label shard_label;
 template<typename T>
 impl::metric_definition_impl make_gauge(metric_name_type name,
         T&& val, description d = description(), std::vector<label_instance> labels = {}) {
-    return {name, {impl::data_type::GAUGE, "gauge"}, make_function(std::forward<T>(val), impl::data_type::GAUGE), d, labels};
+    return {name, {impl::data_type::GAUGE, "gauge"}, impl::make_function(std::forward<T>(val), impl::data_type::GAUGE), d, labels};
 }
 
 /*!
@@ -453,7 +481,7 @@ impl::metric_definition_impl make_gauge(metric_name_type name,
 template<typename T>
 impl::metric_definition_impl make_gauge(metric_name_type name,
         description d, T&& val) {
-    return {name, {impl::data_type::GAUGE, "gauge"}, make_function(std::forward<T>(val), impl::data_type::GAUGE), d, {}};
+    return {name, {impl::data_type::GAUGE, "gauge"}, impl::make_function(std::forward<T>(val), impl::data_type::GAUGE), d, {}};
 }
 
 /*!
@@ -464,55 +492,7 @@ impl::metric_definition_impl make_gauge(metric_name_type name,
 template<typename T>
 impl::metric_definition_impl make_gauge(metric_name_type name,
         description d, std::vector<label_instance> labels, T&& val) {
-    return {name, {impl::data_type::GAUGE, "gauge"}, make_function(std::forward<T>(val), impl::data_type::GAUGE), d, labels};
-}
-
-
-/*!
- * \brief Derive are used when a rate is more interesting than the value.
- *
- * Derive is an integer value that can increase or decrease, typically it is used when looking at the
- * derivation of the value.
- *
- * It is OK to use it when counting things and if no wrap-around is expected (it shouldn't) it's prefer over counter metric.
- */
-template<typename T>
-[[deprecated("Use make_counter()")]]
-impl::metric_definition_impl make_derive(metric_name_type name,
-        T&& val, description d = description(), std::vector<label_instance> labels = {}) {
-    return make_counter(std::move(name), std::forward<T>(val), std::move(d), std::move(labels));
-}
-
-
-/*!
- * \brief Derive are used when a rate is more interesting than the value.
- *
- * Derive is an integer value that can increase or decrease, typically it is used when looking at the
- * derivation of the value.
- *
- * It is OK to use it when counting things and if no wrap-around is expected (it shouldn't) it's prefer over counter metric.
- */
-template<typename T>
-[[deprecated("Use make_counter()")]]
-impl::metric_definition_impl make_derive(metric_name_type name, description d,
-        T&& val) {
-    return make_counter(std::move(name), std::forward<T>(val), std::move(d), {});
-}
-
-
-/*!
- * \brief Derive are used when a rate is more interesting than the value.
- *
- * Derive is an integer value that can increase or decrease, typically it is used when looking at the
- * derivation of the value.
- *
- * It is OK to use it when counting things and if no wrap-around is expected (it shouldn't) it's prefer over counter metric.
- */
-template<typename T>
-[[deprecated("Use make_counter()")]]
-impl::metric_definition_impl make_derive(metric_name_type name, description d, std::vector<label_instance> labels,
-        T&& val) {
-    return make_counter(std::move(name), std::forward<T>(val), std::move(d), std::move(labels));
+    return {name, {impl::data_type::GAUGE, "gauge"}, impl::make_function(std::forward<T>(val), impl::data_type::GAUGE), d, labels};
 }
 
 
@@ -560,18 +540,6 @@ impl::metric_definition_impl make_counter(metric_name_type name, description d, 
     return make_counter(std::move(name), std::forward<T>(val), std::move(d), std::move(labels));
 }
 
-/*!
- * \brief create an absolute metric.
- *
- * Absolute are used for metric that are being erased after each time they are read.
- * They are here for compatibility reasons and should general be avoided in most applications.
- */
-template<typename T>
-[[deprecated("Use make_counter()")]]
-impl::metric_definition_impl make_absolute(metric_name_type name,
-        T&& val, description d = description(), std::vector<label_instance> labels = {}) {
-    return make_counter(std::move(name), std::forward<T>(val), std::move(d), std::move(labels));
-}
 
 /*!
  * \brief create a histogram metric.
@@ -681,4 +649,14 @@ impl::metric_definition_impl make_total_operations(metric_name_type name,
 
 /*! @} */
 }
+}
+
+namespace fmt {
+template<>
+struct formatter<seastar::metrics::impl::escaped_string> : public fmt::formatter<seastar::sstring> {
+    template <typename FormatContext>
+    auto format(const seastar::metrics::impl::escaped_string& s, FormatContext& ctx) const {
+        return fmt::formatter<seastar::sstring>::format(s.value(), ctx);
+    }
+};
 }

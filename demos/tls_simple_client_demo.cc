@@ -18,7 +18,9 @@
 /*
  * Copyright 2015 Cloudius Systems
  */
+#include <iostream>
 #include <cmath>
+#include <ranges>
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/reactor.hh>
@@ -87,7 +89,7 @@ int main(int ac, char** av) {
         }
         return f.then([=]() {
             return net::dns::get_host_by_name(addr).then([=](net::hostent e) {
-                ipv4_addr ia(e.addr_list.front(), port);
+                ipv4_addr ia(e.addr_entries.front().addr, port);
 
                 tls::tls_options options;
                 if (check) {
@@ -95,7 +97,7 @@ int main(int ac, char** av) {
                 }
                 return tls::connect(certs, ia, options).then([=](::connected_socket s) {
                     auto strms = ::make_lw_shared<streams>(std::move(s));
-                    auto range = boost::irange(size_t(0), i);
+                    auto range = std::views::iota(size_t(0), i);
                     return do_for_each(range, [=](auto) {
                         auto f = strms->out.write(*msg);
                         if (!do_read) {
@@ -124,7 +126,7 @@ int main(int ac, char** av) {
                     });
                 });
             }).handle_exception([](auto ep) {
-                std::cerr << "Error: " << ep << std::endl;
+                std::cerr << fmt::format("Error: {}\n", seastar::formattable(ep));
             });
         }).finally([] {
             engine().exit(0);

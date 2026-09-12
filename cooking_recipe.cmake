@@ -110,12 +110,20 @@ cooking_ingredient (nettle
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
 
-# Also a direct dependency of Seastar.
+# A dependency of DPDK.
 cooking_ingredient (numactl
   EXTERNAL_PROJECT_ARGS
     URL https://github.com/numactl/numactl/releases/download/v2.0.12/numactl-2.0.12.tar.gz
     URL_MD5 2ba9777d78bfd7d408a387e53bc33ebc
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR> --srcdir=<SOURCE_DIR>
+    BUILD_COMMAND <DISABLE>
+    INSTALL_COMMAND ${make_command} install)
+
+cooking_ingredient (zlib
+  EXTERNAL_PROJECT_ARGS
+    URL https://github.com/madler/zlib/releases/download/v1.2.13/zlib-1.2.13.tar.gz
+    URL_MD5 9b8aa094c4e5765dabf4da391f00d15c
+    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR>
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
 
@@ -148,7 +156,7 @@ file (WRITE "${boost_user_config}"
 
 cooking_ingredient (Boost
   EXTERNAL_PROJECT_ARGS
-    URL https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.bz2
+    URL https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.bz2
     URL_HASH SHA256=71feeed900fbccca04a3b4f2f84a7c217186f28a940ed8b7ed4725986baf99fa
     PATCH_COMMAND
       ./bootstrap.sh
@@ -177,8 +185,8 @@ cooking_ingredient (GnuTLS
     gmp
     nettle
   EXTERNAL_PROJECT_ARGS
-    URL https://www.gnupg.org/ftp/gcrypt/gnutls/v3.5/gnutls-3.5.18.tar.xz
-    URL_MD5 c2d93d305ecbc55939bc2a8ed4a76a3d
+    URL https://www.gnupg.org/ftp/gcrypt/gnutls/v3.7/gnutls-3.7.11.tar.xz
+    URL_MD5 dd8c16b17f1d37fca203e756e981a957
     CONFIGURE_COMMAND
      ${CMAKE_COMMAND} -E env ${PKG_CONFIG_PATH}
       <SOURCE_DIR>/configure
@@ -193,6 +201,14 @@ cooking_ingredient (GnuTLS
       ${autotools_ingredients_flags}
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
+
+cooking_ingredient (Protobuf
+  REQUIRES zlib
+  EXTERNAL_PROJECT_ARGS
+    URL https://github.com/protocolbuffers/protobuf/releases/download/v21.11//protobuf-cpp-3.21.11.tar.gz
+    URL_MD5 e2cf711edae444bba0da199bc034e031
+  CMAKE_ARGS
+    -Dprotobuf_BUILD_TESTS=OFF)
 
 cooking_ingredient (hwloc
   REQUIRES
@@ -246,25 +262,21 @@ cooking_ingredient (yaml-cpp
 
 cooking_ingredient (c-ares
   EXTERNAL_PROJECT_ARGS
-    URL https://c-ares.haxx.se/download/c-ares-1.13.0.tar.gz
-    URL_MD5 d2e010b43537794d8bedfb562ae6bba2
+    URL https://github.com/c-ares/c-ares/releases/download/v1.32.3/c-ares-1.32.3.tar.gz
+    URL_MD5 d5ed5967bc3a74191c051ce81ffe02fc
     CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=<INSTALL_DIR> --srcdir=<SOURCE_DIR>
     BUILD_COMMAND <DISABLE>
     INSTALL_COMMAND ${make_command} install)
 
-cooking_ingredient (cryptopp
-  EXTERNAL_PROJECT_ARGS
-    URL https://github.com/weidai11/cryptopp/archive/CRYPTOPP_8_7_0.tar.gz
-    URL_MD5 69b11e59094c10d437f295f11e51c16a
-    CONFIGURE_COMMAND <DISABLE>
-    BUILD_IN_SOURCE ON
-    BUILD_COMMAND
-      ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} CXXFLAGS=${CMAKE_CXX_FLAGS} ${make_command} static
-    INSTALL_COMMAND
-      ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} CXXFLAGS=${CMAKE_CXX_FLAGS} ${make_command} install-lib PREFIX=<INSTALL_DIR>)
-
 set (dpdk_args
   --default-library=static
+  # meson derives libdir from the host: lib/<multiarch> if dpkg-architecture is
+  # installed, lib64 if /usr/lib64 is a real directory, lib otherwise. Only the
+  # first two are on the PKG_CONFIG_PATH that cmake's FindPkgConfig builds from
+  # CMAKE_PREFIX_PATH on a debian-like system, so a host without dpkg-dev but
+  # with a real /usr/lib64 installs libdpdk.pc where find_package (dpdk) will
+  # not look. Pin the layout instead of inheriting the guess.
+  --libdir=lib
   -Dc_args="-Wno-error"
   -Denable_docs=false
   -Denable_apps=dpdk-testpmd
@@ -304,8 +316,8 @@ cooking_ingredient (dpdk
 
 cooking_ingredient (fmt
   EXTERNAL_PROJECT_ARGS
-    URL https://github.com/fmtlib/fmt/archive/9.1.0.tar.gz
-    URL_MD5 21fac48cae8f3b4a5783ae06b443973a
+    URL https://github.com/fmtlib/fmt/releases/download/12.2.0/fmt-12.2.0.zip
+    URL_HASH SHA256=a2f4a8d51178f954e4c339007f77edd76ba0cb2e36f87a48e5a5403d9be5878f
   CMAKE_ARGS
     -DFMT_DOC=OFF
     -DFMT_TEST=OFF)

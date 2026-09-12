@@ -19,30 +19,33 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include <malloc.h>
 #include <string.h>
-#include <cassert>
+#include <fcntl.h>
+#include <filesystem>
 #include <ratio>
 #include <optional>
 #include <utility>
+#include <seastar/util/assert.hh>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/fstream.hh>
 #include <seastar/core/align.hh>
 #include <seastar/core/circular_buffer.hh>
+#include <seastar/core/internal/pollable_fd.hh>
+#include <seastar/core/internal/buffer_allocator.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/io_intent.hh>
-#endif
+#include <seastar/core/do_with.hh>
+#include <seastar/net/packet.hh>
+#include <seastar/coroutine/exception.hh>
+#include "core/syscall_result.hh"
+#include "core/thread_pool.hh"
+#include <seastar/util/internal/iovec_utils.hh>
 
 namespace seastar {
 
@@ -72,18 +75,6 @@ static inline T select_buffer_size(T configured_value, T maximum_value) noexcept
     }
 }
 
-#if SEASTAR_API_LEVEL >= 7
-template <typename Options>
-inline internal::maybe_priority_class_ref get_io_priority(const Options& opts) {
-    return internal::maybe_priority_class_ref{};
-}
-#else
-template <typename Options>
-inline internal::maybe_priority_class_ref get_io_priority(const Options& opts) {
-    return internal::maybe_priority_class_ref(opts.io_priority_class);
-}
-#endif
-
 class file_data_source_impl : public data_source_impl {
     struct issued_read {
         uint64_t _pos;
@@ -94,7 +85,7 @@ class file_data_source_impl : public data_source_impl {
             : _pos(pos), _size(size), _ready(std::move(f)) { }
     };
 
-    reactor& _reactor = engine();
+    reactor::io_stats& _stats = reactor::io_stats::local();
     file _file;
     file_input_stream_options _options;
     uint64_t _pos;
@@ -227,7 +218,7 @@ public:
     virtual ~file_data_source_impl() override {
         // If the data source hasn't been closed, we risk having reads in progress
         // that will try to access freed memory.
-        assert(_reads_in_progress == 0);
+        SEASTAR_ASSERT(_reads_in_progress == 0);
     }
     virtual future<temporary_buffer<char>> get() override {
         if (!_read_buffers.empty() && !_read_buffers.front()._ready.available()) {
@@ -237,11 +228,11 @@ public:
         auto ret = std::move(_read_buffers.front());
         _read_buffers.pop_front();
         update_history_consumed(ret._size);
-        _reactor._io_stats.fstream_reads += 1;
-        _reactor._io_stats.fstream_read_bytes += ret._size;
+        _stats.fstream_reads += 1;
+        _stats.fstream_read_bytes += ret._size;
         if (!ret._ready.available()) {
-            _reactor._io_stats.fstream_reads_blocked += 1;
-            _reactor._io_stats.fstream_read_bytes_blocked += ret._size;
+            _stats.fstream_reads_blocked += 1;
+            _stats.fstream_read_bytes_blocked += ret._size;
         }
         return std::move(ret._ready);
     }
@@ -249,7 +240,7 @@ public:
         uint64_t dropped = 0;
         while (n) {
             if (_read_buffers.empty()) {
-                assert(n <= _remain);
+                SEASTAR_ASSERT(n <= _remain);
                 _pos += n;
                 _remain -= n;
                 break;
@@ -267,8 +258,8 @@ public:
                 ignore_read_future(std::move(front._ready));
                 n -= front._size;
                 dropped += front._size;
-                _reactor._io_stats.fstream_read_aheads_discarded += 1;
-                _reactor._io_stats.fstream_read_ahead_discarded_bytes += front._size;
+                _stats.fstream_read_aheads_discarded += 1;
+                _stats.fstream_read_ahead_discarded_bytes += front._size;
                 _read_buffers.pop_front();
             }
         }
@@ -284,8 +275,8 @@ public:
         return _done->get_future().then([this] {
             uint64_t dropped = 0;
             for (auto&& c : _read_buffers) {
-                _reactor._io_stats.fstream_read_aheads_discarded += 1;
-                _reactor._io_stats.fstream_read_ahead_discarded_bytes += c._size;
+                _stats.fstream_read_aheads_discarded += 1;
+                _stats.fstream_read_ahead_discarded_bytes += c._size;
                 dropped += c._size;
                 ignore_read_future(std::move(c._ready));
             }
@@ -317,7 +308,7 @@ private:
             auto len = end - start;
             auto actual_size = std::min(end - _pos, _remain);
             _read_buffers.emplace_back(_pos, actual_size, futurize_invoke([&] {
-                    return _file.dma_read_bulk_impl(start, len, get_io_priority(_options), &_intent);
+                    return _file.dma_read_bulk_impl(start, len, &_intent);
             }).then_wrapped(
                     [this, start, pos = _pos, remain = _remain] (future<temporary_buffer<uint8_t>> ret) {
                 --_reads_in_progress;
@@ -329,7 +320,7 @@ private:
                     return make_exception_future<temporary_buffer<char>>(ret.get_exception());
                 } else {
                     // first or last buffer, need trimming
-                    auto tmp = ret.get0();
+                    auto tmp = ret.get();
                     auto real_end = start + tmp.size();
                     if (real_end <= pos) {
                         return make_ready_future<temporary_buffer<char>>();
@@ -349,17 +340,17 @@ private:
     }
 };
 
-class file_data_source : public data_source {
-public:
-    file_data_source(file f, uint64_t offset, uint64_t len, file_input_stream_options options)
-        : data_source(std::make_unique<file_data_source_impl>(
-                std::move(f), offset, len, options)) {}
-};
+data_source make_file_data_source(file f, uint64_t offset, uint64_t len, file_input_stream_options opt) {
+    return data_source(std::make_unique<file_data_source_impl>(std::move(f), offset, len, std::move(opt)));
+}
 
+data_source make_file_data_source(file f, file_input_stream_options opt) {
+    return make_file_data_source(std::move(f), 0, std::numeric_limits<uint64_t>::max(), std::move(opt));
+}
 
 input_stream<char> make_file_input_stream(
         file f, uint64_t offset, uint64_t len, file_input_stream_options options) {
-    return input_stream<char>(file_data_source(std::move(f), offset, len, std::move(options)));
+    return input_stream<char>(make_file_data_source(std::move(f), offset, len, std::move(options)));
 }
 
 input_stream<char> make_file_input_stream(
@@ -384,14 +375,28 @@ public:
     file_data_sink_impl(file f, file_output_stream_options options)
             : _file(std::move(f)), _options(options) {
         _options.buffer_size = select_buffer_size<unsigned>(_options.buffer_size, _file.disk_write_max_length());
-        _write_behind_sem.ensure_space_for_waiters(1); // So that wait() doesn't throw
+	if (_options.write_behind) {
+            _write_behind_sem.ensure_space_for_waiters(1); // So that wait() doesn't throw
+	}
     }
-    future<> put(net::packet data) override { abort(); }
     virtual temporary_buffer<char> allocate_buffer(size_t size) override {
         return temporary_buffer<char>::aligned(_file.memory_dma_alignment(), size);
     }
+#if SEASTAR_API_LEVEL >= 9
+    future<> put(std::span<temporary_buffer<char>> bufs) override {
+        return data_sink_impl::fallback_put(bufs, [this] (temporary_buffer<char>&& buf) {
+            return do_put(std::move(buf));
+        });
+    }
+#else
     using data_sink_impl::put;
+    future<> put(net::packet data) override { abort(); }
     virtual future<> put(temporary_buffer<char> buf) override {
+        return do_put(std::move(buf));
+    }
+#endif
+private:
+    future<> do_put(temporary_buffer<char> buf) {
         uint64_t pos = _pos;
         _pos += buf.size();
         if (!_options.write_behind) {
@@ -430,13 +435,13 @@ public:
             return make_ready_future<>();
         });
     }
-private:
+
     future<> do_put(uint64_t pos, temporary_buffer<char> buf) noexcept {
       try {
         // put() must usually be of chunks multiple of file::dma_alignment.
         // Only the last part can have an unaligned length. If put() was
         // called again with an unaligned pos, we have a bug in the caller.
-        assert(!(pos & (_file.disk_write_dma_alignment() - 1)));
+        SEASTAR_ASSERT(!(pos & (_file.disk_write_dma_alignment() - 1)));
         bool truncate = false;
         auto p = static_cast<const char*>(buf.get());
         size_t buf_size = buf.size();
@@ -453,12 +458,20 @@ private:
             truncate = true;
         }
 
-        return _file.dma_write_impl(pos, reinterpret_cast<const uint8_t*>(p), buf_size, get_io_priority(_options), nullptr).then(
+        return _file.dma_write_impl(pos, reinterpret_cast<const uint8_t*>(p), buf_size, nullptr).then(
                 [this, pos, buf = std::move(buf), truncate, buf_size] (size_t size) mutable {
             // short write handling
             if (size < buf_size) {
-                buf.trim_front(size);
-                return do_put(pos + size, std::move(buf)).then([this, truncate] {
+                // A write completes a multiple of the disk alignment only when it
+                // goes through O_DIRECT; a buffered one (which is what the reactor
+                // does with the kernel page cache enabled) can complete any amount.
+                // Resume from the last aligned boundary, writing the partially
+                // completed block again: dma_write() requires an aligned position,
+                // and padding an unaligned tail as above would spill over the end
+                // of this request.
+                auto done = align_down<size_t>(size, _file.disk_write_dma_alignment());
+                buf.trim_front(done);
+                return do_put(pos + done, std::move(buf)).then([this, truncate] {
                     if (truncate) {
                         return _file.truncate(_pos);
                     }
@@ -507,7 +520,7 @@ future<data_sink> make_file_data_sink(file f, file_output_stream_options options
                     std::rethrow_exception(std::move(ex));
                 } catch (...) {
                     std::throw_with_nested(std::runtime_error(fmt::format("While handling failed construction of data_sink, caught exception: {}",
-                                fut.get_exception())));
+                                seastar::formattable(fut.get_exception()))));
                 }
             }
             return make_exception_future<data_sink>(std::move(ex));
@@ -528,10 +541,126 @@ future<output_stream<char>> make_file_output_stream(file f, file_output_stream_o
 }
 
 /*
+ * Pipe / stream-fd source and sink implementations.
+ *
+ * I/O is integrated with the reactor's event loop via pollable_fd.
+ * read_some() / write_some() register POLLIN/POLLOUT interest with epoll or
+ * io_uring and resume the calling fiber once the fd is ready, so no
+ * thread-pool thread is blocked waiting for data.  The fd must be in
+ * non-blocking mode (O_NONBLOCK): make_pipe() produces non-blocking fds
+ * naturally; path-based open sets O_NONBLOCK in the thread-pool lambda.
+ *
+ * Suitable for anonymous pipes, named FIFOs, character devices, PTYs, and
+ * any other fd that supports plain read(2)/write(2) but not seekable or
+ * O_DIRECT I/O.
+ */
+
+class pipe_data_source_impl : public data_source_impl, private internal::buffer_allocator {
+    pollable_fd _fd;
+    const size_t _buf_size;
+
+    temporary_buffer<char> allocate_buffer() override {
+        return temporary_buffer<char>(_buf_size);
+    }
+public:
+    pipe_data_source_impl(file_desc fd, size_t buf_size)
+            : _fd(std::move(fd)), _buf_size(buf_size) {}
+
+    future<temporary_buffer<char>> get() override {
+        // read_some waits for POLLIN via the reactor then does a non-blocking read.
+        // n == 0 on EOF: returns empty buffer, signalling end-of-stream.
+        return _fd.read_some(this);
+    }
+
+    future<> close() override {
+        _fd.close();
+        return make_ready_future<>();
+    }
+
+    // Used by the path-based factory to open the device asynchronously.
+    static future<file_desc> open(std::filesystem::path path, int flags) {
+        auto sr = co_await engine()._thread_pool->submit<syscall_result<int>>(
+                internal::thread_pool_submit_reason::file_operation, [path = std::move(path), flags] {
+            return wrap_syscall<int>(::open(path.c_str(), flags | O_CLOEXEC | O_NONBLOCK));
+        });
+        if (sr.failed()) {
+            co_return coroutine::exception(sr.make_system_error_ptr());
+        }
+        co_return file_desc::from_fd(sr.result);
+    }
+};
+
+class pipe_data_sink_impl : public data_sink_impl {
+    pollable_fd _fd;
+public:
+    pipe_data_sink_impl(file_desc fd)
+            : _fd(std::move(fd)) {}
+
+#if SEASTAR_API_LEVEL >= 9
+    future<> put(std::span<temporary_buffer<char>> bufs) override {
+        // Chain all buffer deleters and keep iov alive until write_all completes.
+        deleter del;
+        std::vector<iovec> iov;
+        iov.reserve(bufs.size());
+        for (auto& b : bufs) {
+            iov.push_back({const_cast<char*>(b.get()), b.size()});
+            deleter d = b.release();
+            d.append(std::move(del));
+            del = std::move(d);
+        }
+        // Build the span before moving iov into the finally lambda.  Moving a
+        // vector transfers ownership of its heap buffer without relocating it,
+        // so the span's pointer stays valid for the duration of write_all.
+        auto iovspan = std::span<iovec>(iov);
+        return _fd.write_all(iovspan).finally([del = std::move(del), iov = std::move(iov)] {});
+    }
+#else
+    using data_sink_impl::put;
+    future<> put(temporary_buffer<char> buf) override {
+        auto data = buf.get();
+        auto size = buf.size();
+        return _fd.write_all(data, size).finally([buf = std::move(buf)] {});
+    }
+    future<> put(net::packet data) override {
+        return do_with(std::move(data), [this] (net::packet& p) {
+            return _fd.write_all(p);
+        });
+    }
+#endif
+
+    future<> close() override {
+        _fd.close();
+        return make_ready_future<>();
+    }
+};
+
+input_stream<char> make_pipe_input_stream(file_desc fd, size_t buffer_size) {
+    return input_stream<char>(data_source(
+            std::make_unique<pipe_data_source_impl>(std::move(fd), buffer_size)));
+}
+
+output_stream<char> make_pipe_output_stream(file_desc fd, size_t buffer_size) {
+    output_stream_options opts;
+    opts.trim_to_size = false;
+    return output_stream<char>(data_sink(
+            std::make_unique<pipe_data_sink_impl>(std::move(fd))),
+            buffer_size, opts);
+}
+
+future<input_stream<char>> make_pipe_input_stream(std::filesystem::path path, size_t buffer_size) {
+    auto fd = co_await pipe_data_source_impl::open(std::move(path), O_RDONLY);
+    co_return make_pipe_input_stream(std::move(fd), buffer_size);
+}
+
+future<output_stream<char>> make_pipe_output_stream(std::filesystem::path path, size_t buffer_size) {
+    auto fd = co_await pipe_data_source_impl::open(std::move(path), O_WRONLY);
+    co_return make_pipe_output_stream(std::move(fd), buffer_size);
+}
+
+/*
  * template initialization, definition in iostream-impl.hh
  */
 template struct internal::stream_copy_consumer<char>;
 template future<> copy<char>(input_stream<char>&, output_stream<char>&);
 
 }
-

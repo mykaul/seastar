@@ -65,23 +65,23 @@ int main(int ac, char** av) {
         auto https = config["https"].as<bool>();
 
         return seastar::async([=] {
-            net::hostent e = net::dns::get_host_by_name(host, net::inet_address::family::INET).get0();
-            std::unique_ptr<http::experimental::client> cln;
+            net::hostent e = net::dns::get_host_by_name(host, net::inet_address::family::INET).get();
+            std::unique_ptr<http::client> cln;
             if (https) {
                 auto certs = ::make_shared<tls::certificate_credentials>();
                 certs->set_system_trust().get();
-                fmt::print("{} {}:443{}\n", method, e.addr_list.front(), path);
-                cln = std::make_unique<http::experimental::client>(socket_address(e.addr_list.front(), 443), std::move(certs), host);
+                fmt::print("{} {}:443{}\n", method, e.addr_entries.front().addr, path);
+                cln = std::make_unique<http::client>(socket_address(e.addr_entries.front().addr, 443), std::move(certs), host);
             } else {
-                fmt::print("{} {}:80{}\n", method, e.addr_list.front(), path);
-                cln = std::make_unique<http::experimental::client>(socket_address(e.addr_list.front(), 80));
+                fmt::print("{} {}:80{}\n", method, e.addr_entries.front().addr, path);
+                cln = std::make_unique<http::client>(socket_address(e.addr_entries.front().addr, 80));
             }
             auto req = http::request::make(method, host, path);
             if (body != "") {
                 future<file> f = open_file_dma(body, open_flags::ro);
                 req.write_body("txt", [ f = std::move(f) ] (output_stream<char>&& out) mutable {
                     return seastar::async([f = std::move(f), out = std::move(out)] () mutable {
-                        auto in = make_file_input_stream(f.get0());
+                        auto in = make_file_input_stream(f.get());
                         copy(in, out).get();
                         out.flush().get();
                         out.close().get();
@@ -99,7 +99,7 @@ int main(int ac, char** av) {
 
             cln->close().get();
         }).handle_exception([](auto ep) {
-            fmt::print("Error: {}", ep);
+            fmt::print("Error: {}", seastar::formattable(ep));
         });
     });
 }

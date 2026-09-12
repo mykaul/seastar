@@ -22,20 +22,13 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
-#include <boost/asio/ip/address_v4.hpp>
-#include <arpa/inet.h>
 #include <unordered_map>
 #include <cstdint>
-#include <array>
-#include <map>
 #include <list>
 #include <chrono>
-#endif
 
-#include <seastar/core/array_map.hh>
+#include <seastar/util/internal/array_map.hh>
 #include <seastar/net/byteorder.hh>
-#include <seastar/core/byteorder.hh>
 #include <seastar/net/arp.hh>
 #include <seastar/net/ip_checksum.hh>
 #include <seastar/net/const.hh>
@@ -44,7 +37,6 @@
 #include <seastar/net/toeplitz.hh>
 #include <seastar/net/udp.hh>
 #include <seastar/core/metrics_registration.hh>
-#include <seastar/util/modules.hh>
 
 #include "ipv4_address.hh"
 #include "ipv6_address.hh"
@@ -292,7 +284,7 @@ private:
     ipv4_tcp _tcp;
     ipv4_icmp _icmp;
     ipv4_udp _udp;
-    array_map<ip_protocol*, 256> _l4;
+    internal::array_map<ip_protocol*, 256> _l4;
     ip_packet_filter * _packet_filter = nullptr;
     struct frag {
         packet header;

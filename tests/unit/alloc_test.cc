@@ -19,20 +19,27 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-#include <seastar/testing/test_case.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/shard_id.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/temporary_buffer.hh>
-#include <seastar/util/memory_diagnostics.hh>
+#include <seastar/testing/perf_tests.hh>
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/memory_diagnostics.hh>
 
 #include <memory>
 #include <new>
+#include <limits>
 #include <vector>
 #include <future>
 #include <iostream>
 
+#include <cerrno>
+#include <cstdint>
 #include <malloc.h>
+#include <stdlib.h>
 
 using namespace seastar;
 
@@ -65,6 +72,25 @@ SEASTAR_TEST_CASE(malloc_0_and_free_it) {
     return make_ready_future<>();
 }
 
+SEASTAR_TEST_CASE(new_0) {
+
+    {
+        // new must always return a non-null pointer, even for 0 size
+        auto obj = operator new(0);
+        BOOST_REQUIRE(obj != nullptr);
+        operator delete(obj);
+    }
+
+    {
+        // same test but with a zero length array
+        auto obj = new char[0];
+        BOOST_REQUIRE(obj != nullptr);
+        delete [] obj;
+    }
+
+    return make_ready_future<>();
+}
+
 SEASTAR_TEST_CASE(test_live_objects_counter_with_cross_cpu_free) {
     return smp::submit_to(1, [] {
         auto ret = std::vector<std::unique_ptr<bool>>(1000000);
@@ -90,6 +116,23 @@ SEASTAR_TEST_CASE(test_aligned_alloc) {
     }
     return make_ready_future<>();
 }
+
+#ifdef __cpp_sized_deallocation
+SEASTAR_TEST_CASE(test_sized_delete) {
+    for (size_t size = 0; size <= 65536; size++) {
+        void *p0 = operator new(size), *p1 = operator new(size);
+        BOOST_REQUIRE(p0 != nullptr);
+        BOOST_REQUIRE(p1 != nullptr);
+        ::memset(p0, 1, size);
+        ::memset(p1, 2, size);
+        perf_tests::do_not_optimize(p0);
+        perf_tests::do_not_optimize(p1);
+        operator delete(p0, size);
+        operator delete(p1, size);
+    }
+    return make_ready_future<>();
+}
+#endif
 
 SEASTAR_TEST_CASE(test_temporary_buffer_aligned) {
     for (size_t align = sizeof(void*); align <= 65536; align <<= 1) {
@@ -118,6 +161,59 @@ SEASTAR_TEST_CASE(test_memory_diagnostics) {
     return make_ready_future<>();
 }
 
+SEASTAR_THREAD_TEST_CASE(test_cross_thread_realloc) {
+    // Tests that realloc seems to do the right thing with various sizes of
+    // buffer, including cases where the initial allocation is on another
+    // shard.
+    // Needs at least 2 shards to usefully test the cross-shard aspect but
+    // still passes when only 1 shard is used.
+    auto do_xshard_realloc = [](bool cross_shard, size_t initial_size, size_t realloc_size) {
+        BOOST_TEST_CONTEXT("cross_shard=" << cross_shard << ", initial="
+                << initial_size << ", realloc_size=" << realloc_size) {
+
+            auto other_shard = (this_shard_id() + cross_shard) % this_smp_shard_count();
+
+            char *p = static_cast<char *>(malloc(initial_size));
+
+            // write some sentinels and check them after realloc
+            // x start of region
+            // y end of realloc'd region (if it falls within the initial size)
+            // z end of initial region
+            if (initial_size > 0) {
+                p[0] = 'x';
+                p[initial_size - 1] = 'z';
+                if (realloc_size > 0 && realloc_size <= initial_size) {
+                    p[realloc_size - 1] = 'y';
+                }
+            }
+            smp::submit_to(other_shard, [=] {
+                char* p2 = static_cast<char *>(realloc(p, realloc_size));
+                if (initial_size > 0 && realloc_size > 0) {
+                    BOOST_REQUIRE_EQUAL(p2[0], 'x');
+                    if (realloc_size <= initial_size) {
+                        BOOST_REQUIRE_EQUAL(p2[realloc_size - 1], 'y');
+                    }
+                    if (realloc_size > initial_size) {
+                        BOOST_REQUIRE_EQUAL(p2[initial_size - 1], 'z');
+                    }
+                }
+                free(p2);
+            }).get();
+        }
+    };
+
+    for (auto& cross_shard : {false, true}) {
+        do_xshard_realloc(cross_shard, 0, 0);
+        do_xshard_realloc(cross_shard, 0, 1);
+        do_xshard_realloc(cross_shard, 1, 0);
+        do_xshard_realloc(cross_shard, 50, 100);
+        do_xshard_realloc(cross_shard, 100, 50);
+        do_xshard_realloc(cross_shard, 100000, 500000);
+        do_xshard_realloc(cross_shard, 500000, 100000);
+    }
+}
+
+
 #ifndef SEASTAR_DEFAULT_ALLOCATOR
 
 struct thread_alloc_info {
@@ -126,9 +222,19 @@ struct thread_alloc_info {
     void *ptr;
 };
 
+// Gives the calling thread a chance to lazily initialize whatever per-thread
+// state the allocator needs, so that it is not accounted to the measurement
+// which follows. In particular, the first allocation in a thread registers a
+// thread_local destructor, and that registration itself allocates.
+static void warm_up_thread_local_state() {
+    void* volatile p = ::malloc(1);
+    ::free(p);
+}
+
 template <typename Func>
 thread_alloc_info run_with_stats(Func&& f) {
     return std::async([&f](){
+        warm_up_thread_local_state();
         auto before = seastar::memory::stats();
         void* ptr = f();
         auto after = seastar::memory::stats();
@@ -141,6 +247,7 @@ void test_allocation_function(Func f) {
     // alien alloc and free
     auto alloc_info = run_with_stats(f);
     auto free_info = std::async([p = alloc_info.ptr]() {
+        warm_up_thread_local_state();
         auto before = seastar::memory::stats();
         free(p);
         auto after = seastar::memory::stats();
@@ -161,6 +268,7 @@ void test_allocation_function(Func f) {
     // reactor alloc, alien free
     void *p = f();
     auto alien_cross_frees = std::async([p]() {
+        warm_up_thread_local_state();
         auto frees_before = memory::stats().cross_cpu_frees();
         free(p);
         return memory::stats().cross_cpu_frees()-frees_before;
@@ -231,10 +339,41 @@ SEASTAR_TEST_CASE(test_bad_alloc_throws) {
     BOOST_REQUIRE_THROW(sink = operator new(size), std::bad_alloc);
     BOOST_CHECK_EQUAL(failed_allocs(), 1);
 
+    // test that new[] throws
+    stats = seastar::memory::stats();
+    BOOST_REQUIRE_THROW(sink = new char[size], std::bad_alloc);
+    BOOST_CHECK_EQUAL(failed_allocs(), 1);
+
     // test that huge malloc returns null
     stats = seastar::memory::stats();
     BOOST_REQUIRE_EQUAL(malloc(size), nullptr);
     BOOST_CHECK_EQUAL(failed_allocs(), 1);
+
+    constexpr auto overflowing_page_count =
+        uint64_t(std::numeric_limits<unsigned>::max()) + 2;
+    if constexpr (std::numeric_limits<size_t>::max() / memory::page_size >= overflowing_page_count) {
+        auto truncating_aligned_size = size_t(overflowing_page_count) * memory::page_size;
+
+        // test that aligned allocations whose page count would overflow fail
+        stats = seastar::memory::stats();
+        BOOST_REQUIRE_EQUAL(aligned_alloc(memory::page_size, truncating_aligned_size), nullptr);
+        BOOST_CHECK_EQUAL(failed_allocs(), 1);
+
+        stats = seastar::memory::stats();
+        BOOST_REQUIRE_EQUAL(memalign(memory::page_size, truncating_aligned_size), nullptr);
+        BOOST_CHECK_EQUAL(failed_allocs(), 1);
+
+        stats = seastar::memory::stats();
+        void* p_aligned = nullptr;
+        BOOST_REQUIRE_EQUAL(posix_memalign(&p_aligned, memory::page_size, truncating_aligned_size), ENOMEM);
+        BOOST_REQUIRE_EQUAL(p_aligned, nullptr);
+        BOOST_CHECK_EQUAL(failed_allocs(), 1);
+
+        stats = seastar::memory::stats();
+        BOOST_REQUIRE_THROW(sink = operator new(
+                truncating_aligned_size, std::align_val_t(memory::page_size)), std::bad_alloc);
+        BOOST_CHECK_EQUAL(failed_allocs(), 1);
+    }
 
     // test that huge realloc on nullptr returns null
     stats = seastar::memory::stats();
@@ -277,7 +416,7 @@ SEASTAR_TEST_CASE(test_diagnostics_failures) {
 }
 
 template <typename Func>
-SEASTAR_CONCEPT(requires requires (Func fn) { fn(); })
+requires requires (Func fn) { fn(); }
 void check_function_allocation(const char* name, size_t expected_allocs, Func f) {
     auto before = seastar::memory::stats();
     f();
@@ -292,7 +431,7 @@ SEASTAR_TEST_CASE(test_diagnostics_allocation) {
     check_function_allocation("empty", 0, []{});
 
     check_function_allocation("operator new", 1, []{
-        // note that many pairs of malloc/free-alikes can just be optimized 
+        // note that many pairs of malloc/free-alikes can just be optimized
         // away, but not operator new(size_t), per the standard
         void * volatile p = operator new(1);
         operator delete(p);
@@ -311,6 +450,297 @@ SEASTAR_TEST_CASE(test_diagnostics_allocation) {
     return seastar::make_ready_future();
 }
 
+SEASTAR_TEST_CASE(test_two_allocations_increase_total_bytes_allocated) {
+    auto before = seastar::memory::stats();
+
+    constexpr size_t size1 = 128;
+    constexpr size_t size2 = 256;
+
+    void* volatile p1 = operator new(size1);
+    void* volatile p2 = operator new(size2);
+
+    auto after = seastar::memory::stats();
+
+    BOOST_REQUIRE_EQUAL(after.total_bytes_allocated() - before.total_bytes_allocated(), size1 + size2);
+
+    operator delete(p2);
+    operator delete(p1);
+
+    return seastar::make_ready_future();
+}
+
+#ifdef SEASTAR_HEAPPROF
+
+// small wrapper to disincentivize gcc from unrolling the loop
+[[gnu::noinline]]
+char* malloc_wrapper(size_t size) {
+    auto ret = static_cast<char*>(malloc(size));
+    *ret = 'c'; // to prevent compiler from considering this a dead allocation and optimizing it out
+    return ret;
+}
+
+namespace seastar::memory {
+std::ostream& operator<<(std::ostream& os, const allocation_site& site) {
+    os << "allocation_site[count: " << site.count << ", size: " << site.size << "]";
+    return os;
+}
+}
+
+SEASTAR_TEST_CASE(test_sampled_profile_collection_small)
+{
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 0);
+    }
+
+    // The two loops below are distinct call sites and the assertions require
+    // both of them to be sampled, so each loop has to cover enough sampling
+    // intervals that missing one entirely is not plausible. The sampler draws
+    // the gap to the next sample from an exponential distribution whose mean is
+    // the sampling interval, so a loop allocating N intervals worth of bytes
+    // records nothing with probability e^-N. count/2 * 10 bytes against the 100
+    // byte interval below is N=50, putting the chance of recording one call
+    // site instead of two at about 2*e^-50.
+    std::size_t count = 1000;
+    std::vector<volatile char*> ptrs(count);
+
+    seastar::memory::set_heap_profiling_sampling_rate(100);
+
+#ifdef __clang__
+    #pragma nounroll
+#endif
+    for (std::size_t i = 0; i < count / 2; ++i) {
+        ptrs[i] = malloc_wrapper(10);
+    }
+
+#ifdef __clang__
+    #pragma nounroll
+#endif
+    for (std::size_t i = count / 2; i < count; ++i) {
+        ptrs[i] = malloc_wrapper(10);
+    }
+
+    auto get_samples = []() {
+        auto stats0 = seastar::memory::sampled_memory_profile();
+        auto stats1 = seastar::memory::sampled_memory_profile();
+
+        // two back-to-back copies of the sample should have the same value
+        BOOST_CHECK_EQUAL_COLLECTIONS(stats0.begin(), stats0.end(), stats1.begin(), stats1.end());
+
+        // check that we get the same value from the raw array iterface
+        std::vector<seastar::memory::allocation_site> stats2(stats0.size());
+        auto sz2 = seastar::memory::sampled_memory_profile(stats2.data(), stats2.size());
+        BOOST_CHECK_EQUAL(stats0.size(), sz2);
+        BOOST_CHECK_EQUAL_COLLECTIONS(stats0.begin(), stats0.end(), stats2.begin(), stats2.end());
+
+        // check with +1 size, we expect to still only get size elements
+        std::vector<seastar::memory::allocation_site> stats3(stats0.size() + 1);
+        auto sz3 = seastar::memory::sampled_memory_profile(stats3.data(), stats3.size());
+        BOOST_CHECK_EQUAL(stats0.size(), sz3);
+        stats3.resize(sz3);
+        BOOST_CHECK_EQUAL_COLLECTIONS(stats0.begin(), stats0.end(), stats3.begin(), stats3.end());
+
+        return stats0;
+    };
+
+    // NB: the test framework allocates
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = get_samples();
+        BOOST_REQUIRE_EQUAL(stats.size(), 2);
+        BOOST_REQUIRE_EQUAL(stats[0].size, stats[0].count * 100);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(100);
+
+    for (auto ptr : ptrs) {
+        free((void*)ptr);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = get_samples();
+        BOOST_REQUIRE_EQUAL(stats.size(), 0);
+    }
+
+    return seastar::make_ready_future();
+}
+
+SEASTAR_TEST_CASE(test_sampled_profile_collection_large)
+{
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 0);
+    }
+
+    std::size_t count = 100;
+    std::vector<volatile char*> ptrs(count);
+
+    // Both loops have to be sampled, as in
+    // test_sampled_profile_collection_small: count/2 * 100000 bytes against
+    // this interval is N=25 intervals per loop, so the chance of recording one
+    // call site instead of two is about 2*e^-25. The interval also has to stay
+    // above the 131072 bytes that a 100000 byte request actually allocates, so
+    // that sample_size() accounts each sample as one full interval and the
+    // size == count * sample_rate check below holds.
+    std::size_t sample_rate = 200000;
+
+    seastar::memory::set_heap_profiling_sampling_rate(sample_rate);
+
+#ifdef __clang__
+    #pragma nounroll
+#endif
+    for (std::size_t i = 0; i < count / 2; ++i) {
+        ptrs[i] = malloc_wrapper(100000);
+    }
+
+#ifdef __clang__
+    #pragma nounroll
+#endif
+    for (std::size_t i = count / 2; i < count; ++i) {
+        ptrs[i] = malloc_wrapper(100000);
+    }
+
+    // NB: the test framework allocate
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 2);
+        BOOST_REQUIRE_EQUAL(stats[0].size, stats[0].count * sample_rate);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(sample_rate);
+
+    for (auto ptr : ptrs) {
+        free((void*)ptr);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        // NOTE this is because right now the tracking structure doesn't delete call sites ever
+        BOOST_REQUIRE_EQUAL(stats.size(), 0);
+    }
+
+    return seastar::make_ready_future();
+}
+
+SEASTAR_TEST_CASE(test_sampled_profile_collection_max_sites)
+{
+    std::size_t count = 1010;
+    std::vector<volatile char*> ptrs(count);
+
+    seastar::memory::set_heap_profiling_sampling_rate(100);
+
+    #pragma GCC unroll 1010
+    for (std::size_t i = 0; i < count; ++i) {
+        volatile char* ptr = static_cast<char*>(malloc(1000));
+        *ptr = 'c'; // to prevent compiler from considering this a dead allocation and optimizing it out
+        ptrs[i] = ptr;
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 1000);
+    }
+
+    for (auto ptr : ptrs) {
+        free((void*)ptr);
+    }
+
+    return seastar::make_ready_future();
+}
+
+SEASTAR_TEST_CASE(test_change_sample_rate)
+{
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 0);
+    }
+
+    std::size_t sample_rate = 100;
+    std::size_t count = 10000;
+    std::vector<volatile char*> ptrs(count);
+
+    seastar::memory::set_heap_profiling_sampling_rate(sample_rate);
+
+#ifdef __clang__
+    #pragma nounroll
+#endif
+    for (std::size_t i = 0; i < count; ++i) {
+        ptrs[i] = malloc_wrapper(10);
+    }
+
+    // NB: the test framework allocates
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    size_t last_alloc_size = 0;
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 1);
+        last_alloc_size = stats[0].size;
+        BOOST_REQUIRE_EQUAL(stats[0].size, stats[0].count * sample_rate);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(sample_rate);
+
+    size_t free_iter = 0;
+    // free some of the allocations to check size changes
+    for (size_t i = 0; i < count / 4; ++i, ++free_iter) {
+        free((void*)ptrs[free_iter]);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 1);
+        BOOST_REQUIRE_EQUAL(stats[0].size, stats[0].count * sample_rate);
+        BOOST_REQUIRE_NE(stats[0].size, last_alloc_size);
+        BOOST_REQUIRE_GT(stats[0].size, 0);
+        last_alloc_size = stats[0].size;
+    }
+
+    // now increase the sampling rate with outstanding allocations from the old rate
+    seastar::memory::set_heap_profiling_sampling_rate(sample_rate * 100);
+
+    for (size_t i = 0; i < count / 4; ++i, ++free_iter) {
+        free((void*)ptrs[free_iter]);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 1);
+        BOOST_REQUIRE_LT(stats[0].size, last_alloc_size); // should not have underflowed
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(sample_rate);
+
+    // free the rest
+    for (size_t i = 0; i < count / 2; ++i, ++free_iter) {
+        free((void*)ptrs[free_iter]);
+    }
+
+    seastar::memory::set_heap_profiling_sampling_rate(0);
+
+    {
+        auto stats = seastar::memory::sampled_memory_profile();
+        BOOST_REQUIRE_EQUAL(stats.size(), 0);
+    }
+
+    return seastar::make_ready_future();
+}
+
+
+#endif // SEASTAR_HEAPPROF
 
 #endif // #ifndef SEASTAR_DEFAULT_ALLOCATOR
 
@@ -328,5 +758,60 @@ SEASTAR_TEST_CASE(test_large_allocation_warning_off_by_one) {
 
     free(obj);
 #endif
+    return make_ready_future<>();
+}
+
+#if !(__GLIBC__ == 2 && __GLIBC_MINOR__ >= 43) && !(__GLIBC__ > 2)
+
+extern "C" {
+
+void free_sized(void* ptr, size_t size);
+void free_aligned_sized(void* ptr, size_t alignment, size_t size);
+
+}
+
+#endif
+
+SEASTAR_TEST_CASE(c23_free_sized) {
+    auto p1 = malloc(100);
+    free_sized(p1, 100);
+    void* p2;
+    int r = posix_memalign(&p2, 1024, 4096);
+    BOOST_REQUIRE_EQUAL(r, 0);
+    free_aligned_sized(p2, 1024, 4096);
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_posix_memalign) {
+    auto verify = [](size_t alignment, size_t size) {
+        void *p = NULL;
+        int result = posix_memalign(&p, alignment, size);
+        BOOST_REQUIRE(result == 0);
+        BOOST_REQUIRE(p != nullptr);
+        BOOST_REQUIRE_MESSAGE(
+            (reinterpret_cast<uintptr_t>(p) % alignment) == 0,
+            fmt::format("failed with p {} alignment {} size {}",
+                        fmt::ptr(p), alignment, size));
+        free(p);
+    };
+
+    // posix_memalign does not place a restriction on the allocated size, unlike
+    // aligned_alloc which requires size to be a multiple of alignment. at the
+    // time this test was written verify(32,16) does not fail without the
+    // proceeding allocation.
+    //
+    // this case can be seen in both the glibc test suite:
+    //   https://sourceware.org/git/?p=glibc.git;a=blob;f=malloc/tst-posix_memalign.c;h=5039b6501710a550e71f1bc659b1b5c0baa03cf3;hb=HEAD#l109
+    //
+    // and apple's libmalloc test suite:
+    //   https://opensource.apple.com/source/libmalloc/libmalloc-283.60.1/tests/posix_memalign_test.c.auto.html
+    //
+    // at the time the test is written it will fail on release builds with
+    // seastar allocator and pass when using the default allocator in debug
+    // mode.
+
+    verify(16, 32);
+    verify(32, 16);
+
     return make_ready_future<>();
 }

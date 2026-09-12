@@ -22,13 +22,16 @@
 #pragma once
 
 #include <seastar/core/coroutine.hh>
+#include <source_location>
 
 namespace seastar {
 
 namespace internal {
 
+// This makes calls to the factories below safe elide contexts, so their
+// annotated arguments can propagate to the wrapped coroutine.
 template <bool CheckPreempt, typename T>
-class [[nodiscard]] as_future_awaiter {
+class [[nodiscard]] SEASTAR_CORO_AWAIT_ELIDABLE as_future_awaiter {
     seastar::future<T> _future;
 
 public:
@@ -42,7 +45,8 @@ public:
     }
 
     template<typename U>
-    void await_suspend(std::coroutine_handle<U> hndl) noexcept {
+    void await_suspend(std::coroutine_handle<U> hndl SEASTAR_COROUTINE_LOC_PARAM) noexcept {
+        SEASTAR_COROUTINE_LOC_STORE(hndl.promise());
         if (!CheckPreempt || !_future.available()) {
             _future.set_coroutine(hndl.promise());
         } else {
@@ -83,10 +87,9 @@ namespace coroutine {
 /// returns true.  Use \ref coroutine::as_future_without_preemption_check
 /// to disable preemption checking.
 template<typename T = void>
-class [[nodiscard]] as_future : public seastar::internal::as_future_awaiter<true, T> {
-public:
-    explicit as_future(seastar::future<T>&& f) noexcept : seastar::internal::as_future_awaiter<true, T>(std::move(f)) {}
-};
+inline auto as_future(SEASTAR_CORO_AWAIT_ELIDABLE_ARGUMENT seastar::future<T>&& f) noexcept {
+    return seastar::internal::as_future_awaiter<true, T>(std::move(f));
+}
 
 /// \brief co_await:s a \ref future, returning it as result, without
 /// checking if preemption is needed.
@@ -96,10 +99,9 @@ public:
 /// However, it bypasses checking if the task quota is depleted, which means that
 /// a ready `future` will be handled immediately.
 template<typename T = void>
-class [[nodiscard]] as_future_without_preemption_check : public seastar::internal::as_future_awaiter<false, T> {
-public:
-    explicit as_future_without_preemption_check(seastar::future<T>&& f) noexcept : seastar::internal::as_future_awaiter<false, T>(std::move(f)) {}
-};
+inline auto as_future_without_preemption_check(SEASTAR_CORO_AWAIT_ELIDABLE_ARGUMENT seastar::future<T>&& f) noexcept {
+    return seastar::internal::as_future_awaiter<false, T>(std::move(f));
+}
 
 } // namespace seastar::coroutine
 

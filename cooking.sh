@@ -64,7 +64,7 @@ where OPTIONS are:
 -l
 -h
 
-By default, cmake-cooking reads a file called `cooking_recipe.cmake`.
+By default, cmake-cooking reads a file called 'cooking_recipe.cmake'.
 
 If neither [-i] nor [-e] are specified with a recipe ([-r]), then all ingredients of the recipe
 will be fetched and built.
@@ -80,7 +80,7 @@ Option details:
 
 -r RECIPE
 
-    Instead of reading the recipe in a file called `cooking_recipe.cmake`, follow the recipe
+    Instead of reading the recipe in a file called 'cooking_recipe.cmake', follow the recipe
     in the named file.
 
     If the recipe file is a relative path, it is interpretted relative to the source directory
@@ -229,6 +229,17 @@ if [ -z "${ingredients_dir}" ]; then
     ingredients_dir="${cooking_dir}/installed"
 fi
 
+#
+# Validate recipe.
+#
+
+if [ -n "${recipe}" ]; then
+    if [ ! -f "${recipe}" ]; then
+        echo "Cooking: The '${recipe}' recipe does not exist!" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "${build_dir}"
 
 cat <<'EOF' > "${build_dir}/Cooking.cmake"
@@ -320,13 +331,14 @@ macro (project name)
 
       set (_cooking_ready_marker_file ${_cooking_dir}/ready.txt)
 
-      add_custom_command (
-        OUTPUT ${_cooking_ready_marker_file}
-        DEPENDS _cooking_ingredients
-        COMMAND ${CMAKE_COMMAND} -E touch ${_cooking_ready_marker_file})
-
+      # The marker file is NOT registered as an OUTPUT of add_custom_command
+      # because that causes ninja to delete it during "ninja clean". If the
+      # marker is missing when cmake is later re-triggered (e.g. after git
+      # checkout), the project() macro returns early and only cooking targets
+      # are generated — all real build targets vanish.
       add_custom_target (_cooking_ingredients_ready
-        DEPENDS ${_cooking_ready_marker_file})
+        COMMAND ${CMAKE_COMMAND} -E touch ${_cooking_ready_marker_file})
+      add_dependencies (_cooking_ingredients_ready _cooking_ingredients)
 
       set (_cooking_local_synchronize_marker_file ${Cooking_INGREDIENTS_DIR}/.cooking_local_synchronize)
 
@@ -866,17 +878,6 @@ if [ -d "${ingredients_dir}" -a -z "${nested}" ]; then
 fi
 
 mkdir -p "${ingredients_dir}"
-
-#
-# Validate recipe.
-#
-
-if [ -n "${recipe}" ]; then
-    if [ ! -f "${recipe}" ]; then
-        echo "Cooking: The '${recipe}' recipe does not exist!" >&2
-        exit 1
-    fi
-fi
 
 #
 # Prepare lists of included and excluded ingredients.

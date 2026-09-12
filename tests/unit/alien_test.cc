@@ -30,7 +30,9 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/util/later.hh>
 #include <stdexcept>
+#include <ranges>
 #include <tuple>
+
 
 using namespace seastar;
 
@@ -47,9 +49,11 @@ int main(int argc, char** argv)
     auto alien_done = file_desc::eventfd(0, 0);
     seastar::app_template app;
 
+    unsigned shard_count = 0;
+
     // use the raw fd, because seastar engine want to take over the fds, if it
     // polls on them.
-    auto zim = std::async([&app, engine_ready_fd,
+    auto zim = std::async([&app, &shard_count, engine_ready_fd,
                            alien_done=alien_done.get()] {
         eventfd_t result = 0;
         // wait until the seastar engine is ready
@@ -68,7 +72,7 @@ int main(int argc, char** argv)
         });
         // test for alien::submit_to(), which returns a std::future<int>
         std::vector<std::future<int>> counts;
-        for (auto i : boost::irange(0u, smp::count)) {
+        for (auto i : std::views::iota(0u, shard_count)) {
             // send messages from alien.
             counts.push_back(alien::submit_to(app.alien(), i, [i] {
                 return seastar::make_ready_future<int>(i);
@@ -89,8 +93,9 @@ int main(int argc, char** argv)
 
     eventfd_t result = 0;
     app.run(argc, argv, [&] {
-        return seastar::now().then([engine_ready_fd] {
+        return seastar::now().then([engine_ready_fd, &shard_count] {
             // engine ready!
+            shard_count = this_smp_shard_count();
             ::eventfd_write(engine_ready_fd, ENGINE_READY);
             return seastar::now();
         }).then([alien_done = std::move(alien_done), &result]() mutable {
@@ -110,7 +115,7 @@ int main(int argc, char** argv)
             }
             return seastar::now();
         }).handle_exception([](auto ep) {
-            std::cerr << "Error: " << ep << std::endl;
+            std::cerr << fmt::format("Error: {}\n", seastar::formattable(ep));
         }).finally([] {
             seastar::engine().exit(0);
         });
@@ -120,7 +125,7 @@ int main(int argc, char** argv)
         std::cerr << "Bad everything: " << everything << " != " << expected << std::endl;
         return 1;
     }
-    const auto shards = boost::irange(0u, smp::count);
+    const auto shards = std::views::iota(0u, shard_count);
     auto expected = std::accumulate(std::begin(shards), std::end(shards), 0);
     if (total != expected) {
         std::cerr << "Bad total: " << total << " != " << expected << std::endl;

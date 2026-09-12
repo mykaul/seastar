@@ -53,18 +53,14 @@
 #include <seastar/core/posix.hh>
 #include <seastar/util/bool_class.hh>
 #include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
 #include "./internal/api-level.hh"
-#ifndef SEASTAR_MODULE
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string_view>
-#endif
 
 namespace seastar {
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 // iostream.hh
 template <class CharType> class input_stream;
@@ -88,11 +84,9 @@ using udp_channel = class datagram_channel;
 
 }
 
-namespace experimental {
 // process.hh
 class process;
 struct spawn_parameters;
-}
 
 // Networking API
 
@@ -159,24 +153,6 @@ future<connected_socket> connect(socket_address sa, socket_address local, transp
 ///
 /// \return a \ref socket object that can be used for establishing connections
 socket make_socket();
-
-/// Creates a udp_channel object suitable for sending UDP packets
-///
-/// The channel is not bound to a local address, and thus can only be used
-/// for sending.
-///
-/// \return a \ref net::udp_channel object that can be used for UDP transfers.
-[[deprecated("Use `make_unbound_datagram_channel` instead")]]
-net::udp_channel make_udp_channel();
-
-
-/// Creates a udp_channel object suitable for sending and receiving UDP packets
-///
-/// \param local local address to bind to
-///
-/// \return a \ref net::udp_channel object that can be used for UDP transfers.
-[[deprecated("Use `make_bound_datagram_channel` instead")]]
-net::udp_channel make_udp_channel(const socket_address& local);
 
 /// Creates a datagram_channel object suitable for sending datagrams to
 /// destinations that belong to the provided address family.
@@ -340,11 +316,12 @@ future<> remove_file(std::string_view name) noexcept;
 ///
 /// \param old_name existing file name
 /// \param new_name new file name
+/// \param flags \c renameat2 flags - see man page for renameat2 and \ref rename_flags.
 ///
 /// \note
 /// The rename is not guaranteed to be stable on disk, unless the
 /// both containing directories are sync'ed.
-future<> rename_file(std::string_view old_name, std::string_view new_name) noexcept;
+future<> rename_file(std::string_view old_name, std::string_view new_name, rename_flags flags = rename_flags::none) noexcept;
 
 struct follow_symlink_tag { };
 using follow_symlink = bool_class<follow_symlink_tag>;
@@ -359,6 +336,36 @@ using follow_symlink = bool_class<follow_symlink_tag>;
 /// with follow_symlink::yes, or for the link itself, with follow_symlink::no.
 future<stat_data> file_stat(std::string_view name, follow_symlink fs = follow_symlink::yes) noexcept;
 
+/// Return stat information about a file in a directory.
+///
+/// \param directory a open directory
+/// \param name name of the file to return its stat information
+/// \param fs a follow_symlink flag to follow symbolic links.
+///
+/// \return stat_data of the file identified by name.
+///
+/// If the pathname given in \c name is relative, then it is interpreted relative to the open \c directory.
+/// If pathname given in \c name is absolute, then \c directory is ignored.
+///
+/// If name identifies a symbolic link then stat_data is returned either for the target of the link,
+/// with follow_symlink::yes, or for the link itself, with follow_symlink::no.
+future<stat_data> file_stat(file& directory, std::string_view name, follow_symlink fs = follow_symlink::yes) noexcept;
+
+/// Wrapper around getgrnam_r.
+/// If the provided group name does not exist in the group database, this call will return an empty optional.
+/// If the provided group name exists in the group database, the optional returned will contain the struct group_details information.
+/// When an unexpected error is thrown by the getgrnam_r libc call, this function throws std::system_error with std::error_code.
+/// \param groupname name of the group
+///
+/// \return optional struct group_details of the group identified by name. struct group_details has details of the group from the group database.
+future<std::optional<struct group_details>> getgrnam(std::string_view name);
+
+/// Change the owner and group of file. This is a wrapper around chown syscall.
+/// The function throws std::system_error, when the chown syscall fails.
+/// \param filepath
+/// \param owner
+/// \param group
+future<> chown(std::string_view filepath, uid_t owner, gid_t group);
 /// Return the size of a file.
 ///
 /// \param name name of the file to return the size
@@ -430,10 +437,14 @@ future<uint64_t> fs_avail(std::string_view name) noexcept;
 future<uint64_t> fs_free(std::string_view name) noexcept;
 /// @}
 
-namespace experimental {
+/// Return filesystem-wide space_info where a file is located.
+///
+/// \param name name of the file in the filesystem to inspect
+future<std::filesystem::space_info> file_system_space(std::string_view name) noexcept;
+
 /// \defgroup interprocess-module Interprocess Communication
 ///
-/// Seastar provides a set of APIs for interprocess communicate
+/// Seastar provides a set of APIs for interprocess communication.
 
 /// \addtogroup interprocess-module
 /// @{
@@ -461,12 +472,17 @@ future<process> spawn_process(const std::filesystem::path& pathname,
 ///
 /// \return a process representing the spawned subprocess
 /// \note
-/// the this overload does not specify a \c params parameters for spawning the
+/// this overload does not specify a \c params parameter for spawning the
 /// subprocess. Instead, it uses the pathname for the \c argv[0] in the params.
 future<process> spawn_process(const std::filesystem::path& pathname);
 /// @}
+
+namespace experimental {
+/// \deprecated Use \c seastar::make_pipe instead
+using seastar::make_pipe;
+/// \deprecated Use \c seastar::spawn_process instead
+using seastar::spawn_process;
 }
 
-SEASTAR_MODULE_EXPORT_END
 
 }

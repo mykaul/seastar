@@ -19,9 +19,6 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <iostream>
 #include <map>
@@ -32,44 +29,43 @@ module;
 #include <system_error>
 #include <chrono>
 #include <algorithm>
+#include <ranges>
 
 #include <fmt/core.h>
-#if FMT_VERSION >= 60000
 #include <fmt/chrono.h>
 #include <fmt/color.h>
 #include <fmt/ostream.h>
-#elif FMT_VERSION >= 50000
-#include <fmt/time.h>
-#endif
+#include <fmt/std.h>
 #include <boost/any.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/program_options.hpp>
-#include <boost/range/adaptor/map.hpp>
 #include <cxxabi.h>
 #include <syslog.h>
 #include <unistd.h>
 
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/util/log.hh>
-#include <seastar/core/smp.hh>
 #include <seastar/util/log-cli.hh>
 
-#include <seastar/core/array_map.hh>
+#include <seastar/util/internal/array_map.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/print.hh>
 
 
 #include "core/program_options.hh"
-#endif
 
 using namespace std::chrono_literals;
 
 struct wrapped_log_level {
     seastar::log_level level;
+};
+
+static const std::map<seastar::log_level, std::string_view> log_level_names = {
+        { seastar::log_level::trace, "trace" },
+        { seastar::log_level::debug, "debug" },
+        { seastar::log_level::info, "info" },
+        { seastar::log_level::warn, "warn" },
+        { seastar::log_level::error, "error" },
 };
 
 namespace fmt {
@@ -84,7 +80,7 @@ template <> struct formatter<wrapped_log_level> {
 
     template <typename FormatContext>
     auto format(wrapped_log_level wll, FormatContext& ctx) const {
-        static seastar::array_map<seastar::sstring, nr_levels> text = {
+        static seastar::internal::array_map<seastar::sstring, nr_levels> text = {
             { int(log_level::debug), "DEBUG" },
             { int(log_level::info),  "INFO " },
             { int(log_level::trace), "TRACE" },
@@ -93,8 +89,7 @@ template <> struct formatter<wrapped_log_level> {
         };
         int index = static_cast<int>(wll.level);
         std::string_view name = text[index];
-#if FMT_VERSION >= 60000
-        static seastar::array_map<text_style, nr_levels> style = {
+        static seastar::internal::array_map<text_style, nr_levels> style = {
             { int(log_level::debug), fg(terminal_color::green)  },
             { int(log_level::info),  fg(terminal_color::white)  },
             { int(log_level::trace), fg(terminal_color::blue)   },
@@ -105,11 +100,16 @@ template <> struct formatter<wrapped_log_level> {
             return fmt::format_to(ctx.out(), "{}",
                 fmt::format(style[index], "{}", name));
         }
-#endif
         return fmt::format_to(ctx.out(), "{}", name);
     }
 };
 bool formatter<wrapped_log_level>::colored = true;
+
+auto formatter<seastar::log_level>::format(seastar::log_level level, format_context& ctx) const
+    -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", log_level_names.at(level));
+}
+
 }
 
 namespace seastar {
@@ -145,7 +145,7 @@ void log_buf::realloc_buffer_and_append(char c) noexcept {
     _alloc_failure = true;
     std::string_view msg = "(log buffer allocation failure)";
     auto can_copy = std::min(msg.size(), size_t(_current - _begin));
-    std::memcpy(_current - can_copy, msg.begin(), can_copy);
+    std::memcpy(_current - can_copy, msg.data(), can_copy);
   }
 }
 
@@ -253,7 +253,11 @@ static internal::log_buf::inserter_iterator print_real_timestamp(internal::log_b
     if (this_second.t != t) {
         this_second.t = t;
         this_second.buf.clear();
-        fmt::format_to(this_second.buf.back_insert_begin(), "{:%Y-%m-%d %T}", fmt::localtime(t));
+        std::tm tm_local;
+        if (!localtime_r(&t, &tm_local)) {
+            throw fmt::format_error("time_t value out of range");
+        }
+        fmt::format_to(this_second.buf.back_insert_begin(), "{:%F %T}", tm_local);
     }
     auto ms = (n - clock::from_time_t(t)) / 1ms;
     return fmt::format_to(it, "{},{:03d}", this_second.buf.view(), ms);
@@ -261,13 +265,6 @@ static internal::log_buf::inserter_iterator print_real_timestamp(internal::log_b
 
 static internal::log_buf::inserter_iterator (*print_timestamp)(internal::log_buf::inserter_iterator) = print_no_timestamp;
 
-const std::map<log_level, sstring> log_level_names = {
-        { log_level::trace, "trace" },
-        { log_level::debug, "debug" },
-        { log_level::info, "info" },
-        { log_level::warn, "warn" },
-        { log_level::error, "error" },
-};
 
 std::ostream& operator<<(std::ostream& out, log_level level) {
     return out << log_level_names.at(level);
@@ -311,14 +308,14 @@ logger::~logger() {
 
 static thread_local std::array<char, 8192> static_log_buf;
 
-bool logger::rate_limit::check() {
+bool logger::rate_limit::rate_limited() {
     const auto now = clock::now();
     if (now < _next) {
         ++_dropped_messages;
-        return false;
+        return true;
     }
     _next = now + _interval;
-    return true;
+    return false;
 }
 
 logger::rate_limit::rate_limit(std::chrono::milliseconds interval)
@@ -359,7 +356,7 @@ logger::do_log(log_level level, log_writer& writer) {
         auto it = buf.back_insert_begin();
         it = print_once(it);
         *it = '\0';
-        static array_map<int, 20> level_map = {
+        static internal::array_map<int, 20> level_map = {
                 { int(log_level::debug), LOG_DEBUG },
                 { int(log_level::info), LOG_INFO },
                 { int(log_level::trace), LOG_DEBUG },  // no LOG_TRACE
@@ -376,15 +373,17 @@ logger::do_log(log_level level, log_writer& writer) {
     }
 }
 
-void logger::failed_to_log(std::exception_ptr ex, format_info fmt) noexcept
+void logger::failed_to_log(std::exception_ptr ex,
+                           fmt::string_view fmt,
+                           std::source_location loc) noexcept
 {
     try {
-        lambda_log_writer writer([ex = std::move(ex), fmt = std::move(fmt)] (internal::log_buf::inserter_iterator it) {
-            it = fmt::format_to(it, "{}:{} @{}: failed to log message", fmt.loc.file_name(), fmt.loc.line(), fmt.loc.function_name());
-            if (!fmt.format.empty()) {
-                it = fmt::format_to(it, ": fmt='{}'", fmt.format);
+        lambda_log_writer writer([ex = std::move(ex), fmt, loc] (internal::log_buf::inserter_iterator it) {
+            it = fmt::format_to(it, "{}:{} @{}: failed to log message", loc.file_name(), loc.line(), loc.function_name());
+            if (fmt.size() > 0) {
+                it = fmt::format_to(it, ": fmt='{}'", fmt);
             }
-            return fmt::format_to(it, ": {}", ex);
+            return fmt::format_to(it, ": {}", seastar::formattable(ex));
         });
         do_log(log_level::error, writer);
     } catch (...) {
@@ -399,11 +398,6 @@ logger::set_ostream(std::ostream& out) noexcept {
 
 void
 logger::set_ostream_enabled(bool enabled) noexcept {
-    _ostream.store(enabled, std::memory_order_relaxed);
-}
-
-void
-logger::set_stdout_enabled(bool enabled) noexcept {
     _ostream.store(enabled, std::memory_order_relaxed);
 }
 
@@ -429,7 +423,7 @@ bool logger::is_shard_zero() noexcept {
 void
 logger_registry::set_all_loggers_level(log_level level) {
     std::lock_guard<std::mutex> g(_mutex);
-    for (auto&& l : _loggers | boost::adaptors::map_values) {
+    for (auto&& l : _loggers | std::views::values) {
         l->set_level(level);
     }
 }
@@ -449,7 +443,7 @@ logger_registry::set_logger_level(sstring name, log_level level) {
 std::vector<sstring>
 logger_registry::get_all_logger_names() {
     std::lock_guard<std::mutex> g(_mutex);
-    auto ret = _loggers | boost::adaptors::map_keys;
+    auto ret = _loggers | std::views::keys;
     return std::vector<sstring>(ret.begin(), ret.end());
 }
 
@@ -532,7 +526,7 @@ logger_registry& global_logger_registry() {
 }
 
 sstring level_name(log_level level) {
-    return  log_level_names.at(level);
+    return sstring(log_level_names.at(level));
 }
 
 namespace log_cli {
@@ -629,44 +623,35 @@ logging_settings extract_settings(const options& opts) {
 }
 
 }
-namespace boost {
-template<>
-seastar::log_level lexical_cast(const std::string& source) {
-    std::istringstream in(source);
-    seastar::log_level level;
-    if (!(in >> level)) {
-        throw boost::bad_lexical_cast();
-    }
-    return level;
-}
 
-}
-
-namespace std {
-std::ostream& operator<<(std::ostream& out, const std::exception_ptr& eptr) {
+auto fmt::formatter<seastar::internal::formattable_exception_ptr>::format(
+        const seastar::internal::formattable_exception_ptr& fe, fmt::format_context& ctx) const
+    -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    const auto& eptr = fe.eptr;
     if (!eptr) {
-        out << "<no exception>";
-        return out;
+        return fmt::format_to(out, "<no exception>");
     }
     try {
         std::rethrow_exception(eptr);
     } catch(...) {
         auto tp = abi::__cxa_current_exception_type();
         if (tp) {
-            out << seastar::pretty_type_name(*tp);
+            out = fmt::format_to(out, "{}", seastar::pretty_type_name(*tp));
         } else {
             // This case shouldn't happen...
-            out << "<unknown exception>";
+            out = fmt::format_to(out, "<unknown exception>");
         }
         // Print more information on some familiar exception types
         try {
             throw;
         } catch (const seastar::nested_exception& ne) {
-            out << fmt::format(": {} (while cleaning up after {})", ne.inner, ne.outer);
+            out = fmt::format_to(out, ": {} (while cleaning up after {})",
+                    seastar::formattable(ne.inner), seastar::formattable(ne.outer));
         } catch (const std::system_error& e) {
-            out << " (error " << e.code() << ", " << e.what() << ")";
+            out = fmt::format_to(out, " (error {}, {})", e.code(), e.what());
         } catch (const std::exception& e) {
-            out << " (" << e.what() << ")";
+            out = fmt::format_to(out, " ({})", e.what());
         } catch (...) {
             // no extra info
         }
@@ -674,7 +659,7 @@ std::ostream& operator<<(std::ostream& out, const std::exception_ptr& eptr) {
         try {
             throw;
         } catch (const std::nested_exception& ne) {
-            out << ": " << ne.nested_ptr();
+            out = fmt::format_to(out, ": {}", seastar::formattable(ne.nested_ptr()));
         } catch (...) {
             // do nothing
         }
@@ -682,12 +667,20 @@ std::ostream& operator<<(std::ostream& out, const std::exception_ptr& eptr) {
     return out;
 }
 
+#ifdef SEASTAR_DEPRECATED_OSTREAM_FORMATTERS
+namespace std {
+
+std::ostream& operator<<(std::ostream& out, const std::exception_ptr& eptr) {
+    return out << fmt::format("{}", seastar::formattable(eptr));
+}
+
 std::ostream& operator<<(std::ostream& out, const std::exception& e) {
-    return out << seastar::pretty_type_name(typeid(e)) << " (" << e.what() << ")";
+    return out << fmt::format("{}", e);
 }
 
 std::ostream& operator<<(std::ostream& out, const std::system_error& e) {
-    return out << seastar::pretty_type_name(typeid(e)) << " (error " << e.code() << ", " << e.what() << ")";
+    return out << fmt::format("{}", e);
 }
 
 }
+#endif

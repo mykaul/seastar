@@ -19,22 +19,12 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#include <string.h>
-#include <string>
-#include <vector>
 #include <sstream>
+#include <fmt/core.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/loop.hh>
-#include <seastar/core/print.hh>
 #include <seastar/json/json_elements.hh>
-#endif
 
 namespace seastar {
 
@@ -81,7 +71,7 @@ public:
         try {
             add(element->_name, element->to_string());
         } catch (...) {
-            std::throw_with_nested(std::runtime_error(format("Json generation failed for field: {}",element->_name)));
+            std::throw_with_nested(std::runtime_error(fmt::format("Json generation failed for field: {}",element->_name)));
         }
     }
 
@@ -148,6 +138,9 @@ public:
      * @return a string of accumulative object
      */
     future<> done() {
+        if (!open) {
+            return _s.write(json_builder::OPEN + json_builder::CLOSE);
+        }
         return _s.write(json_builder::CLOSE);
     }
 

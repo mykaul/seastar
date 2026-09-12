@@ -25,18 +25,14 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/net/packet.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
-#ifndef SEASTAR_MODULE
-#include <memory>
-#include <vector>
-#endif
+#include <string_view>
 
 namespace seastar {
 
-SEASTAR_MODULE_EXPORT
 template <typename CharType>
-class scattered_message {
+class
+[[deprecated("Use output_stream::write(span<temporary_buffer>) from API level 9")]]
+scattered_message {
 private:
     using fragment = net::fragment;
     using packet = net::packet;

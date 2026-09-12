@@ -20,9 +20,7 @@
  */
 #pragma once
 
-#include <chrono>
 #include <seastar/net/api.hh>
-#include <seastar/core/internal/api-level.hh>
 #include <seastar/core/memory.hh>
 
 namespace seastar {
@@ -78,7 +76,9 @@ public:
     virtual socket_address local_address() const = 0;
     virtual future<datagram> receive() = 0;
     virtual future<> send(const socket_address& dst, const char* msg) = 0;
-    virtual future<> send(const socket_address& dst, packet p) = 0;
+    // The ownership of temporary_buffer-s referenced by span must be transferred
+    // synchronously before returning the future
+    virtual future<> send(const socket_address& dst, std::span<temporary_buffer<char>> bufs) = 0;
     virtual void shutdown_input() = 0;
     virtual void shutdown_output() = 0;
     virtual bool is_closed() const = 0;

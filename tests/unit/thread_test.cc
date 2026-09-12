@@ -21,6 +21,7 @@
  */
 
 #include <seastar/core/thread.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -29,6 +30,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/util/assert.hh>
 #include <sys/mman.h>
 #include <signal.h>
 
@@ -97,10 +99,55 @@ SEASTAR_TEST_CASE(test_thread_async_nested) {
     return async([] {
         return async([] {
             return 3;
-        }).get0();
+        }).get();
     }).then([] (int three) {
         BOOST_REQUIRE_EQUAL(three, 3);
     });
+}
+
+SEASTAR_TEST_CASE(test_thread_switch_to) {
+    auto other_sg0 = co_await create_scheduling_group("thread switch_to sg0", 10.f);
+    auto other_sg1 = co_await create_scheduling_group("thread switch_to sg1", 10.f);
+    std::exception_ptr ex;
+
+    try {
+        auto base_sg = current_scheduling_group();
+        co_await async([base_sg, other_sg0, other_sg1] {
+            BOOST_REQUIRE(current_scheduling_group() == base_sg);
+
+            auto prev_sg = thread::switch_to(other_sg0);
+            BOOST_REQUIRE(current_scheduling_group() == other_sg0);
+            BOOST_REQUIRE(prev_sg == base_sg);
+
+            // A yield() reschedules the thread without touching its
+            // scheduling group, so it should still be other_sg0 afterwards.
+            thread::yield();
+            BOOST_REQUIRE(current_scheduling_group() == other_sg0);
+
+            // Switching to the group the thread is already in is a no-op:
+            // it still returns that same group as the "previous" one.
+            auto same_sg = thread::switch_to(other_sg0);
+            BOOST_REQUIRE(current_scheduling_group() == other_sg0);
+            BOOST_REQUIRE(same_sg == other_sg0);
+
+            auto prev_sg2 = thread::switch_to(other_sg1);
+            BOOST_REQUIRE(current_scheduling_group() == other_sg1);
+            BOOST_REQUIRE(prev_sg2 == other_sg0);
+
+            auto back_sg = thread::switch_to(base_sg);
+            BOOST_REQUIRE(current_scheduling_group() == base_sg);
+            BOOST_REQUIRE(back_sg == other_sg1);
+        });
+        BOOST_REQUIRE(current_scheduling_group() == base_sg);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await destroy_scheduling_group(other_sg1);
+    co_await destroy_scheduling_group(other_sg0);
+    if (ex) {
+        std::rethrow_exception(std::move(ex));
+    }
 }
 
 void compute(float& result, bool& done, uint64_t& ctr) {
@@ -200,7 +247,7 @@ static void* pagealign(void* ptr, size_t page_size) {
 static thread_local struct sigaction default_old_sigsegv_handler;
 
 static void bypass_stack_guard(int sig, siginfo_t* si, void* ctx) {
-    assert(sig == SIGSEGV);
+    SEASTAR_ASSERT(sig == SIGSEGV);
     int flags = get_mprotect_flags(ctx);
     stack_guard_bypassed = (flags & PROT_WRITE);
     if (!stack_guard_bypassed) {
@@ -208,7 +255,7 @@ static void bypass_stack_guard(int sig, siginfo_t* si, void* ctx) {
     }
     size_t page_size = getpagesize();
     auto mp_result = mprotect(pagealign(si->si_addr, page_size), page_size, PROT_READ | PROT_WRITE);
-    assert(mp_result == 0);
+    SEASTAR_ASSERT(mp_result == 0);
 }
 
 // This test will fail with a regular stack size, because we only probe

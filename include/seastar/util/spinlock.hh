@@ -21,15 +21,13 @@
 
 #pragma once
 
-#include <seastar/util/modules.hh>
+#include <seastar/util/assert.hh>
 
-#ifndef SEASTAR_MODULE
 #include <atomic>
-#include <cassert>
+#include <new>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
-#endif
 #endif
 
 namespace seastar {
@@ -67,11 +65,21 @@ inline void cpu_relax() {
     __asm__ volatile("yield");
 }
 
+#elif defined(__riscv)
+
+[[gnu::always_inline]]
+inline void cpu_relax() {
+    // Zihintpause `pause` hint, encoded directly so old assemblers without
+    // Zihintpause support still build. On cores that don't implement the hint
+    // it decodes as a NOP.
+    __asm__ volatile(".int 0x0100000F" : : : "memory");
+}
+
 #else
 
 [[gnu::always_inline]]
 inline void cpu_relax() {}
-#warn "Using an empty cpu_relax() for this architecture"
+#warning "Using an empty cpu_relax() for this architecture"
 
 #endif
 
@@ -84,19 +92,25 @@ namespace util {
 // BasicLockable.
 // Async-signal safe.
 // unlock() "synchronizes with" lock().
-SEASTAR_MODULE_EXPORT
-class spinlock {
+#ifdef __cpp_lib_hardware_interference_size
+class alignas(std::hardware_constructive_interference_size) spinlock {
+#else
+// x86-64 cache line size
+class alignas(64) spinlock {
+#endif
     std::atomic<bool> _busy = { false };
 public:
     spinlock() = default;
     spinlock(const spinlock&) = delete;
-    ~spinlock() { assert(!_busy.load(std::memory_order_relaxed)); }
+    ~spinlock() { SEASTAR_ASSERT(!_busy.load(std::memory_order_relaxed)); }
     bool try_lock() noexcept {
         return !_busy.exchange(true, std::memory_order_acquire);
     }
     void lock() noexcept {
         while (_busy.exchange(true, std::memory_order_acquire)) {
-            internal::cpu_relax();
+            while (_busy.load(std::memory_order_relaxed)) {
+                internal::cpu_relax();
+            }
         }
     }
     void unlock() noexcept {

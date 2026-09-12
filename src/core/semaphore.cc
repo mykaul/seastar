@@ -19,17 +19,9 @@
  * Copyright (C) 2020 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#include <fmt/format.h>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/semaphore.hh>
-#endif
 
 namespace seastar {
 
@@ -85,7 +77,7 @@ static_assert(std::is_nothrow_move_constructible_v<named_semaphore>);
 
 named_semaphore_timed_out::named_semaphore_timed_out(std::string_view msg) noexcept : _msg() {
     try {
-        _msg = format("Semaphore timed out: {}", msg);
+        _msg = seastar::format("Semaphore timed out: {}", msg);
     } catch (...) {
         // ignore, empty _msg will generate a static message in what().
     }
@@ -93,7 +85,7 @@ named_semaphore_timed_out::named_semaphore_timed_out(std::string_view msg) noexc
 
 broken_named_semaphore::broken_named_semaphore(std::string_view msg) noexcept : _msg() {
     try {
-        _msg = format("Semaphore broken: {}", msg);
+        _msg = seastar::format("Semaphore broken: {}", msg);
     } catch (...) {
         // ignore, empty _msg will generate a static message in what().
     }
@@ -101,7 +93,7 @@ broken_named_semaphore::broken_named_semaphore(std::string_view msg) noexcept : 
 
 named_semaphore_aborted::named_semaphore_aborted(std::string_view msg) noexcept : _msg() {
     try {
-        _msg = format("Semaphore aborted: {}", msg);
+        _msg = seastar::format("Semaphore aborted: {}", msg);
     } catch (...) {
         // ignore, empty _msg will generate a static message in what().
     }

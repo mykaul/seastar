@@ -19,41 +19,27 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <memory>
 #include <algorithm>
-#include <bitset>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <iostream>
-#include <limits>
-#include <queue>
-#include <unordered_map>
 #include <vector>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/sstring.hh>
-#include <seastar/core/app-template.hh>
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/metrics.hh>
-#include <seastar/core/print.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/http/internal/content_source.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/string_utils.hh>
-#endif
+#include <seastar/coroutine/switch_to.hh>
 
 
 using namespace std::chrono_literals;
@@ -74,7 +60,8 @@ http_stats::http_stats(http_server& server, const sstring& name)
             sm::make_gauge("connections_current", [&server] { return server.current_connections(); }, sm::description("The current number of open  connections"), labels),
             sm::make_counter("read_errors", [&server] { return server.read_errors(); }, sm::description("The total number of errors while reading http requests"), labels),
             sm::make_counter("reply_errors", [&server] { return server.reply_errors(); }, sm::description("The total number of errors while replying to http"), labels),
-            sm::make_counter("requests_served", [&server] { return server.requests_served(); }, sm::description("The total number of http requests served"), labels)
+            sm::make_counter("requests_served", [&server] { return server.requests_served(); }, sm::description("The total number of http requests served"), labels),
+            sm::make_counter("tls_handshake_errors", [&server] { return server.tls_handshake_errors(); }, sm::description("The total number of TLS handshake failures"), labels)
     });
 }
 
@@ -98,57 +85,39 @@ future<> connection::do_response_loop() {
 }
 
 future<> connection::start_response() {
-    if (_resp->_body_writer) {
-        return _resp->write_reply_to_connection(*this).then_wrapped([this] (auto f) {
-            if (f.failed()) {
-                // In case of an error during the write close the connection
-                _server._respond_errors++;
-                _done = true;
-                _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
-                _replies.push(std::unique_ptr<http::reply>());
-                f.ignore_ready_future();
-                return make_ready_future<>();
-            }
-            return _write_buf.write("0\r\n\r\n", 5);
-        }).then_wrapped([this ] (auto f) {
-            if (f.failed()) {
-                // We could not write the closing sequence
-                // Something is probably wrong with the connection,
-                // we should close it, so the client will disconnect
-                _done = true;
-                _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
-                _replies.push(std::unique_ptr<http::reply>());
-                f.ignore_ready_future();
-                return make_ready_future<>();
-            } else {
-                return _write_buf.flush();
-            }
-        }).then_wrapped([this] (auto f) {
-            if (f.failed()) {
-                // flush failed. just close the connection
-                _done = true;
-                _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
-                _replies.push(std::unique_ptr<http::reply>());
-                f.ignore_ready_future();
-            }
-            _resp.reset();
+    return _resp->write_reply(out()).then_wrapped([this] (auto f) {
+        if (f.failed()) {
+            // In case of an error during the write close the connection
+            _server._respond_errors++;
+            _done = true;
+            _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
+            _replies.push(std::unique_ptr<http::reply>());
+            f.ignore_ready_future();
+        }
+        return make_ready_future<>();
+    }).then_wrapped([this ] (auto f) {
+        if (f.failed()) {
+            // We could not write the closing sequence
+            // Something is probably wrong with the connection,
+            // we should close it, so the client will disconnect
+            _done = true;
+            _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
+            _replies.push(std::unique_ptr<http::reply>());
+            f.ignore_ready_future();
             return make_ready_future<>();
-        });
-    }
-    set_headers(*_resp);
-    _resp->_headers["Content-Length"] = to_sstring(
-            _resp->_content.size());
-    return _write_buf.write(_resp->_response_line.data(),
-            _resp->_response_line.size()).then([this] {
-        return _resp->write_reply_headers(*this);
-    }).then([this] {
-        return _write_buf.write("\r\n", 2);
-    }).then([this] {
-        return write_body();
-    }).then([this] {
-        return _write_buf.flush();
-    }).then([this] {
+        } else {
+            return _write_buf.flush();
+        }
+    }).then_wrapped([this] (auto f) {
+        if (f.failed()) {
+            // flush failed. just close the connection
+            _done = true;
+            _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
+            _replies.push(std::unique_ptr<http::reply>());
+            f.ignore_ready_future();
+        }
         _resp.reset();
+        return make_ready_future<>();
     });
 }
 
@@ -195,9 +164,21 @@ set_request_content(std::unique_ptr<http::request> req, input_stream<char>* cont
     } else {
         // Read the entire content into the request content string
         return util::read_entire_stream_contiguous(*content_stream).then([req = std::move(req)] (sstring content) mutable {
-            req->content = std::move(content);
+            http::internal::deprecated_content(*req) = std::move(content);
             return make_ready_future<std::unique_ptr<http::request>>(std::move(req));
         });
+    }
+}
+
+static void set_header_connection(http::reply& resp, bool keep_alive) {
+    if (keep_alive) {
+        if (resp._version == "1.0") {
+            resp.add_header("Connection", "Keep-Alive");
+        }
+    } else {
+        if (resp._version == "1.1") {
+            resp.add_header("Connection", "close");
+        }
     }
 }
 
@@ -206,7 +187,7 @@ void connection::generate_error_reply_and_close(std::unique_ptr<http::request> r
     // TODO: Handle HTTP/2.0 when it releases
     resp->set_version(req->_version);
     resp->set_status(status, msg);
-    resp->done();
+    set_header_connection(*resp, false);
     _done = true;
     _replies.push(std::move(resp));
 }
@@ -226,6 +207,8 @@ future<> connection::read_one() {
 
         if (_tls) {
             req->protocol_name = "https";
+            req->tls_dn = _tls_dn ? &*_tls_dn : nullptr;
+            req->tls_san = _tls_san ? &*_tls_san : nullptr;
         }
         if (_parser.failed()) {
             if (req->_version.empty()) {
@@ -259,7 +242,7 @@ future<> connection::read_one() {
                     auto continue_reply = std::make_unique<http::reply>();
                     set_headers(*continue_reply);
                     continue_reply->set_version(req->_version);
-                    continue_reply->set_status(http::reply::status_type::continue_).done();
+                    continue_reply->set_status(http::reply::status_type::continue_);
                     this->_replies.push(std::move(continue_reply));
                     return make_ready_future<std::unique_ptr<http::request>>(std::move(req));
                 });
@@ -305,20 +288,39 @@ future<> connection::process() {
         try {
             std::get<0>(joined).get();
         } catch (...) {
-            hlogger.debug("Read exception encountered: {}", std::current_exception());
+            hlogger.debug("Read exception encountered: {}", seastar::formattable(std::current_exception()));
         }
         try {
             std::get<1>(joined).get();
         } catch (...) {
-            hlogger.debug("Response exception encountered: {}", std::current_exception());
+            hlogger.debug("Response exception encountered: {}", seastar::formattable(std::current_exception()));
         }
         return make_ready_future<>();
     }).finally([this]{
         return _read_buf.close().handle_exception([](std::exception_ptr e) {
-            hlogger.debug("Close exception encountered: {}", e);
+            hlogger.debug("Close exception encountered: {}", seastar::formattable(e));
         });
     });
 }
+
+future<> connection::prepare() {
+    if (_tls) {
+        // Wait for the TLS handshake to complete, if it hasn't already, and
+        // then also retrieve the client certificate's Subject Distinguished
+        // Name (DN) and Subject Alternative Name (SAN).
+        // These are stored in the connection (_tls_dn and _tls_san) and
+        // referenced in every request so that request handlers can perform
+        // certificate-based authentication.
+        // Note: these are fetched once and cached for the lifetime of the
+        // connection. TLS 1.2 allows mid-connection renegotiation, which can
+        // change the client certificate; in that case the cached DN/SAN will
+        // not be updated. TLS 1.3 does not support renegotiation, so this is
+        // not an issue there.
+        _tls_dn = co_await tls::get_dn_information(_fd);
+        _tls_san = co_await tls::get_alt_name_information(_fd);
+    }
+}
+
 void connection::shutdown() {
     _fd.shutdown_input();
     _fd.shutdown_output();
@@ -339,14 +341,13 @@ future<> connection::respond() {
     });
 }
 
-future<> connection::write_body() {
-    return _write_buf.write(_resp->_content.data(),
-            _resp->_content.size());
-}
-
 void connection::set_headers(http::reply& resp) {
-    resp._headers["Server"] = "Seastar httpd";
-    resp._headers["Date"] = _server._date;
+    if (_server._server_header.has_value()) {
+        resp._headers["Server"] = *_server._server_header;
+    }
+    if (_server._generate_date_header) {
+        resp._headers["Date"] = _server._date;
+    }
 }
 
 future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
@@ -354,23 +355,20 @@ future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
     resp->set_version(req->_version);
     set_headers(*resp);
     bool keep_alive = req->should_keep_alive();
-    if (keep_alive && req->_version == "1.0") {
-        resp->_headers["Connection"] = "Keep-Alive";
-    }
+    set_header_connection(*resp, keep_alive);
 
     sstring url = req->parse_query_param();
     sstring version = req->_version;
+    if (req->_method == "HEAD") {
+        resp->skip_body();
+    }
     return _server._routes.handle(url, std::move(req), std::move(resp)).
     // Caller guarantees enough room
     then([this, keep_alive , version = std::move(version)](std::unique_ptr<http::reply> rep) {
-        rep->set_version(version).done();
+        rep->set_version(version);
         this->_replies.push(std::move(rep));
         return make_ready_future<bool>(!keep_alive);
     });
-}
-
-void http_server::set_tls_credentials(server_credentials_ptr credentials) {
-    _credentials = credentials;
 }
 
 size_t http_server::get_content_length_limit() const {
@@ -389,7 +387,36 @@ void http_server::set_content_streaming(bool b) {
     _content_streaming = b;
 }
 
-future<> http_server::listen(socket_address addr, listen_options lo, 
+const std::optional<sstring>& http_server::get_server_header() const {
+    return _server_header;
+}
+
+void http_server::set_server_header(std::optional<sstring> value) {
+    _server_header = std::move(value);
+}
+
+bool http_server::get_generate_date_header() const {
+    return _generate_date_header;
+}
+
+void http_server::set_generate_date_header(bool b) {
+    if (b == _generate_date_header) {
+        return;
+    }
+    _generate_date_header = b;
+    if (b) {
+        _date = http_date();
+        _date_format_timer.arm_periodic(1s);
+    } else {
+        _date_format_timer.cancel();
+    }
+}
+
+void http_server::set_request_scheduling_group(scheduling_group sg) {
+    _request_scheduling_group = sg;
+}
+
+future<> http_server::listen(socket_address addr, listen_options lo,
             server_credentials_ptr listener_credentials) {
     if (listener_credentials) {
         _listeners.push_back(seastar::tls::listen(listener_credentials, addr, lo));
@@ -426,15 +453,33 @@ future<> http_server::stop() {
     return tasks_done;
 }
 
-// FIXME: This could return void
+// This is a named class member coroutine, so that 'this', 'which' and 'tls'
+// live safely in the coroutine frame, therefore `accept_loop()` can safely suspend
+// at `co_await do_accept_one()`.
+future<> http_server::accept_loop(int which, bool tls) {
+    while (!_task_gate.is_closed()) {
+        try {
+            co_await do_accept_one(which, tls);
+        } catch (const gate_closed_exception&) {
+            co_return;
+        } catch (const std::system_error& e) {
+            // We expect a ECONNABORTED when http_server::stop is called,
+            // no point in warning about that.
+            if (e.code().value() != ECONNABORTED) {
+                hlogger.error("accept failed: {}", e);
+            }
+        } catch (...) {
+            hlogger.error("accept failed: {}", seastar::formattable(std::current_exception()));
+        }
+    }
+}
+
 future<> http_server::do_accepts(int which, bool tls) {
     (void)try_with_gate(_task_gate, [this, which, tls] {
-        return keep_doing([this, which, tls] {
-            return try_with_gate(_task_gate, [this, which, tls] {
-                return do_accept_one(which, tls);
-            });
-        }).handle_exception_type([](const gate_closed_exception& e) {});
-    }).handle_exception_type([](const gate_closed_exception& e) {});
+        return accept_loop(which, tls);
+    }).handle_exception_type([which, tls] (const gate_closed_exception& e) {
+        hlogger.warn("In http_server::do_accepts(), try_with_gate(which={}, tls={}): {}", which, tls, e.what());
+    });
     return make_ready_future<>();
 }
 
@@ -443,24 +488,43 @@ future<> http_server::do_accepts(int which){
 }
 
 future<> http_server::do_accept_one(int which, bool tls) {
-    return _listeners[which].accept().then([this, tls] (accept_result ar) mutable {
-        auto local_address = ar.connection.local_address();
-        auto conn = std::make_unique<connection>(*this, std::move(ar.connection),
-                std::move(ar.remote_address), std::move(local_address), tls);
-        (void)try_with_gate(_task_gate, [conn = std::move(conn)]() mutable {
-            return conn->process().handle_exception([conn = std::move(conn)] (std::exception_ptr ex) {
-                hlogger.error("request error: {}", ex);
-            });
-        }).handle_exception_type([] (const gate_closed_exception& e) {});
-    }).handle_exception_type([] (const std::system_error &e) {
-        // We expect a ECONNABORTED when http_server::stop is called,
-        // no point in warning about that.
-        if (e.code().value() != ECONNABORTED) {
-            hlogger.error("accept failed: {}", e);
-        }
-    }).handle_exception([] (std::exception_ptr ex) {
-        hlogger.error("accept failed: {}", ex);
-    });
+    auto ar = co_await _listeners[which].accept();
+    if (_keepalive_params) {
+        ar.connection.set_keepalive(true);
+        ar.connection.set_keepalive_parameters(_keepalive_params.value());
+    }
+    // The lambda passed to try_with_gate must not be a coroutine,
+    // because try_with_gate invokes it but does not store it: a coroutine
+    // lambda would be destroyed while its frame is still running.
+    (void)try_with_gate(_task_gate,
+            [this, conn_fd = std::move(ar.connection),
+             remote_address = std::move(ar.remote_address), tls]() mutable {
+        return do_process_connection(std::move(conn_fd), std::move(remote_address), tls);
+    }).handle_exception_type([] (const gate_closed_exception& e) {});
+}
+
+// Named member coroutine for per-connection processing, called from the
+// non-coroutine lambda in try_with_gate inside do_accept_one(). Parameters
+// are passed by value so they live safely in the coroutine frame.
+future<> http_server::do_process_connection(connected_socket conn_fd, socket_address remote_address, bool tls) {
+    auto local_address = conn_fd.local_address();
+    auto conn = std::make_unique<connection>(*this, std::move(conn_fd),
+            std::move(remote_address), std::move(local_address), tls);
+    try {
+        co_await conn->prepare();
+    } catch (...) {
+        ++_tls_handshake_errors;
+        hlogger.debug("connection preparation failed: {}", seastar::formattable(std::current_exception()));
+        co_return;
+    }
+    if (_request_scheduling_group) {
+        co_await coroutine::switch_to(*_request_scheduling_group);
+    }
+    try {
+        co_await conn->process();
+    } catch (...) {
+        hlogger.error("request error: {}", seastar::formattable(std::current_exception()));
+    }
 }
 
 uint64_t http_server::total_connections() const {
@@ -477,6 +541,9 @@ uint64_t http_server::read_errors() const {
 }
 uint64_t http_server::reply_errors() const {
     return _respond_errors;
+}
+uint64_t http_server::tls_handshake_errors() const {
+    return _tls_handshake_errors;
 }
 
 // Write the current date in the specific "preferred format" defined in
@@ -505,7 +572,7 @@ future<> http_server_control::start(const sstring& name) {
     return _server_dist->start(name);
 }
 
-future<> http_server_control::stop() {
+future<> http_server_control::stop() noexcept {
     return _server_dist->stop();
 }
 
@@ -531,7 +598,7 @@ future<> http_server_control::listen(socket_address addr, listen_options lo, htt
     return _server_dist->invoke_on_all<future<> (http_server::*)(socket_address, listen_options, http_server::server_credentials_ptr)>(&http_server::listen, addr, lo, credentials);
 }
 
-distributed<http_server>& http_server_control::server() {
+sharded<http_server>& http_server_control::server() {
     return *_server_dist;
 }
 

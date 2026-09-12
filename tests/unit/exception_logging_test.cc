@@ -32,6 +32,18 @@
 
 using namespace seastar;
 
+#ifndef SEASTAR_BACKTRACE_UNIMPLEMENTED
+static void check_regex_match(const std::string& msg, const std::string& regex_str) {
+    std::regex re(regex_str, std::regex_constants::ECMAScript | std::regex_constants::icase);
+    if (!std::regex_search(msg, re)) {
+        BOOST_TEST_MESSAGE("Regex mismatch");
+        BOOST_TEST_MESSAGE("  msg:   " + msg);
+        BOOST_TEST_MESSAGE("  regex: " + regex_str);
+    }
+    BOOST_REQUIRE(std::regex_search(msg, re));
+}
+#endif
+
 // a class which is not derived from std::exception
 // to play the part of the unknown object in the logging
 // function.
@@ -54,7 +66,7 @@ void exception_generator(uint32_t test_instance, int nesting_level) {
             exception_generator(test_instance>>1, nesting_level-1);
         }
     } catch(...) {
-        auto msg = format("Exception Level {}", nesting_level);
+        auto msg = fmt::format("Exception Level {}", nesting_level);
         if(test_instance&1) {
             // Throw a non std::exception derived type
             std::throw_with_nested(unknown_obj(msg));
@@ -64,9 +76,9 @@ void exception_generator(uint32_t test_instance, int nesting_level) {
     }
     if (nesting_level == 0) {
         if (test_instance & 1) {
-            throw unknown_obj(format("Exception Level {}", nesting_level));
+            throw unknown_obj(fmt::format("Exception Level {}", nesting_level));
         } else {
-            throw std::runtime_error(format("Exception Level {}", nesting_level));
+            throw std::runtime_error(fmt::format("Exception Level {}", nesting_level));
         }
     }
 }
@@ -75,18 +87,27 @@ void exception_generator(uint32_t test_instance, int nesting_level) {
 // thrown by the  exception generator function with a specific output.
 std::string exception_generator_str(uint32_t test_instance,int nesting_level) {
     std::ostringstream ret;
+#ifdef _LIBCPP_VERSION
+    // libc++'s throw_with_nested() uses its own __nested<T> wrapper class.
+    // Type names are taken verbatim from the demangler, which may or may not
+    // include the inline ABI namespace depending on the class.
     const std::string runtime_err_str = "std::runtime_error";
-    const std::string exception_level_fmt_str = "Exception Level {}";
+    const std::string unknown_obj_str = "unknown_obj";
+    const std::string nested_exception_with_unknown_obj_str = "std::__nested<unknown_obj>";
+    const std::string nested_exception_with_runtime_err_str = "std::__nested<std::runtime_error>";
+#else
+    const std::string runtime_err_str = "std::runtime_error";
     const std::string unknown_obj_str = "unknown_obj";
     const std::string nested_exception_with_unknown_obj_str = "std::_Nested_exception<unknown_obj>";
     const std::string nested_exception_with_runtime_err_str = "std::_Nested_exception<std::runtime_error>";
+#endif
 
     for(; nesting_level > 0; nesting_level--) {
         if (test_instance & 1) {
-            ret << nested_exception_with_unknown_obj_str;
+            fmt::print(ret, "{}", nested_exception_with_unknown_obj_str);
         } else {
-            ret << nested_exception_with_runtime_err_str << " (" <<
-                    format(exception_level_fmt_str.c_str(), nesting_level) << ")";
+            fmt::print(ret, "{} (Exception Level {})", nested_exception_with_runtime_err_str,
+                       nesting_level);
         }
         ret << ": ";
         test_instance >>= 1;
@@ -94,9 +115,9 @@ std::string exception_generator_str(uint32_t test_instance,int nesting_level) {
 
 
     if (test_instance & 1) {
-        ret << unknown_obj_str;
+        fmt::print(ret, "{}", unknown_obj_str);
     } else {
-        ret << runtime_err_str << " (" << format(exception_level_fmt_str.c_str(), nesting_level) << ")";
+        fmt::print(ret, "{} (Exception Level {})", runtime_err_str, nesting_level);
     }
     return ret.str();
 }
@@ -113,7 +134,7 @@ BOOST_AUTO_TEST_CASE(nested_exception_logging1) {
             try {
                 exception_generator(inst, level);
             } catch(...) {
-                log_msg << std::current_exception();
+                log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
             }
             BOOST_REQUIRE_EQUAL(log_msg.str(), exception_generator_str(inst, level));
         }
@@ -126,7 +147,7 @@ BOOST_AUTO_TEST_CASE(nested_exception_logging2) {
     try {
         throw std::nested_exception();
     } catch(...) {
-        log_msg << std::current_exception();
+        log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
     }
 
     BOOST_REQUIRE_EQUAL(log_msg.str(), std::string("std::nested_exception: <no exception>"));
@@ -155,12 +176,16 @@ BOOST_AUTO_TEST_CASE(nested_exception_logging3) {
             try {
                 std::throw_with_nested(unknown_obj("This is an unknown object"));
             } catch (...) {
-                log_msg << std::current_exception();
+                log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
             }
         }
     }
 
+#ifdef _LIBCPP_VERSION
+    std::string expected_string("std::__nested<unknown_obj>: std::__nested<std::__1::system_error> (error generic:1, my error: Operation not permitted): very_important_exception (very important information)");
+#else
     std::string expected_string("std::_Nested_exception<unknown_obj>: std::_Nested_exception<std::system_error> (error generic:1, my error: Operation not permitted): very_important_exception (very important information)");
+#endif
 
     BOOST_REQUIRE_EQUAL(log_msg.str(), expected_string);
 }
@@ -170,7 +195,7 @@ BOOST_AUTO_TEST_CASE(unknown_object_thrown_test) {
     try {
         throw unknown_obj("This is an unknown object");
     } catch(...) {
-        log_msg << std::current_exception();
+        log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
     }
 
     BOOST_REQUIRE_EQUAL(log_msg.str(), std::string("unknown_obj"));
@@ -184,7 +209,17 @@ BOOST_AUTO_TEST_CASE(format_error_test) {
     l.set_ostream(log_msg);
 
     const char* fmt = "bad format string: {}";
+#ifdef SEASTAR_LOGGER_COMPILE_TIME_FMT
+    // {fmt} v8.0 and up comes with compile-time format string checking, so
+    // malformed format_string passed to `logger.error(format_string, args)`
+    // can be identified at compile time. but a runtime variable passed to
+    // `logger.error(msg)` cannot be considered as a format string anymore
+    // when compiled with {fmt} v8.0 and up. so we have to test with a runtime
+    // format string here
+    l.error(fmt::runtime(fmt));
+#else
     l.error(fmt);
+#endif
 
     BOOST_TEST_MESSAGE(log_msg.str());
     BOOST_REQUIRE_NE(log_msg.str().find(__builtin_FILE()), std::string::npos);
@@ -197,13 +232,12 @@ BOOST_AUTO_TEST_CASE(throw_with_backtrace_exception_logging) {
     try {
         throw_with_backtrace<std::runtime_error>("throw_with_backtrace_exception_logging");
     } catch(...) {
-        log_msg << std::current_exception();
+        log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
     }
 
 #ifndef SEASTAR_BACKTRACE_UNIMPLEMENTED
-    auto regex_str = "backtraced<std::runtime_error> \\(throw_with_backtrace_exception_logging Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+\\)";
-    std::regex expected_msg_re(regex_str, std::regex_constants::ECMAScript | std::regex_constants::icase);
-    BOOST_REQUIRE(std::regex_search(log_msg.str(), expected_msg_re));
+    auto regex_str = "backtraced<std::runtime_error> \\(throw_with_backtrace_exception_logging Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+(\\s+\\(BuildId: [0-9a-z]+\\))?\\)";
+    check_regex_match(log_msg.str(), regex_str);
 #endif
 }
 
@@ -215,14 +249,20 @@ BOOST_AUTO_TEST_CASE(throw_with_backtrace_nested_exception_logging) {
         try {
             std::throw_with_nested(unknown_obj("This is an unknown object"));
         } catch (...) {
-            log_msg << std::current_exception();
+            log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
         }
     }
 
 #ifndef SEASTAR_BACKTRACE_UNIMPLEMENTED
-    auto regex_str = "std::_Nested_exception<unknown_obj>.*backtraced<std::runtime_error> \\(outer Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+\\)";
-    std::regex expected_msg_re(regex_str, std::regex_constants::ECMAScript | std::regex_constants::icase);
-    BOOST_REQUIRE(std::regex_search(log_msg.str(), expected_msg_re));
+#ifdef _LIBCPP_VERSION
+    // libc++'s throw_with_nested() uses its own __nested<T> wrapper class.
+    static const char* nested_exception_re = "std::__nested<unknown_obj>";
+#else
+    static const char* nested_exception_re = "std::_Nested_exception<unknown_obj>";
+#endif
+
+    auto regex_str = std::string(nested_exception_re) + ".*backtraced<std::runtime_error> \\(outer Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+(\\s+\\(BuildId: [0-9a-z]+\\))?\\)";
+    check_regex_match(log_msg.str(), regex_str);
 #endif
 }
 
@@ -239,16 +279,15 @@ BOOST_AUTO_TEST_CASE(throw_with_backtrace_seastar_nested_exception_logging) {
             try {
                 throw seastar::nested_exception(std::move(inner), std::move(outer));
             } catch (...) {
-                log_msg << std::current_exception();
+                log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
             }
         }
     }
 
 #ifndef SEASTAR_BACKTRACE_UNIMPLEMENTED
-    auto regex_str = "seastar::nested_exception:.*backtraced<std::runtime_error> \\(inner Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+\\)"
+    auto regex_str = "seastar::nested_exception:.*backtraced<std::runtime_error> \\(inner Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+(\\s+\\(BuildId: [0-9a-z]+\\))?\\)"
             " \\(while cleaning up after unknown_obj\\)";
-    std::regex expected_msg_re(regex_str, std::regex_constants::ECMAScript | std::regex_constants::icase);
-    BOOST_REQUIRE(std::regex_search(log_msg.str(), expected_msg_re));
+    check_regex_match(log_msg.str(), regex_str);
 #endif
 }
 
@@ -265,15 +304,15 @@ BOOST_AUTO_TEST_CASE(double_throw_with_backtrace_seastar_nested_exception_loggin
             try {
                 throw seastar::nested_exception(std::move(inner), std::move(outer));
             } catch (...) {
-                log_msg << std::current_exception();
+                log_msg << fmt::format("{}", seastar::formattable(std::current_exception()));
             }
         }
     }
+    BOOST_TEST_MESSAGE(log_msg.str());
 
 #ifndef SEASTAR_BACKTRACE_UNIMPLEMENTED
-    auto regex_str = "seastar::nested_exception:.*backtraced<std::runtime_error> \\(inner Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+\\)"
-            " \\(while cleaning up after .*backtraced<std::runtime_error> \\(outer Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+\\)\\)";
-    std::regex expected_msg_re(regex_str, std::regex_constants::ECMAScript | std::regex_constants::icase);
-    BOOST_REQUIRE(std::regex_search(log_msg.str(), expected_msg_re));
+    auto regex_str = "seastar::nested_exception:.*backtraced<std::runtime_error> \\(inner Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+(\\s+\\(BuildId: [0-9a-z]+\\))?\\)"
+            " \\(while cleaning up after .*backtraced<std::runtime_error> \\(outer Backtrace:(\\s+(\\S+\\+)?0x[0-9a-f]+)+(\\s+\\(BuildId: [0-9a-z]+\\))?\\)\\)";
+    check_regex_match(log_msg.str(), regex_str);
 #endif
 }

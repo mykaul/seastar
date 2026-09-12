@@ -19,29 +19,43 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <algorithm>
-#include <iostream>
 #include <memory>
+#include <string_view>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/http/file_handler.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/app-template.hh>
 #include <seastar/http/exception.hh>
-#endif
 
 namespace seastar {
 
 namespace httpd {
+
+// Refuse a decoded path that could escape doc_root: any ".." segment, or a
+// leading '/' (get_decoded_param() strips the matcher's own '/', so one here
+// means a doubled slash like "//etc"). It also percent-decodes the value, so
+// encoded traversal like "%2e%2e%2f" is already "../" and is caught here too.
+static bool is_unsafe_path(std::string_view path) {
+    if (!path.empty() && path.front() == '/') {
+        return true;
+    }
+    for (size_t start = 0; start <= path.size();) {
+        size_t sep = path.find('/', start);
+        auto segment = path.substr(start, sep - start);
+        if (segment == "..") {
+            return true;
+        }
+        if (sep == std::string_view::npos) {
+            break;
+        }
+        start = sep + 1;
+    }
+    return false;
+}
 
 directory_handler::directory_handler(const sstring& doc_root,
         file_transformer* transformer)
@@ -50,7 +64,12 @@ directory_handler::directory_handler(const sstring& doc_root,
 
 future<std::unique_ptr<http::reply>> directory_handler::handle(const sstring& path,
         std::unique_ptr<http::request> req, std::unique_ptr<http::reply> rep) {
-    sstring full_path = doc_root + req->param["path"];
+    sstring decoded_path = req->param.get_decoded_param("path");
+    if (is_unsafe_path(decoded_path)) {
+        rep->set_status(http::reply::status_type::not_found);
+        return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
+    }
+    sstring full_path = doc_root + decoded_path;
     auto h = this;
     return engine().file_type(full_path).then(
             [h, full_path, req = std::move(req), rep = std::move(rep)](auto val) mutable {
@@ -63,7 +82,7 @@ future<std::unique_ptr<http::reply>> directory_handler::handle(const sstring& pa
                     }
                     return h->read(full_path, std::move(req), std::move(rep));
                 }
-                rep->set_status(http::reply::status_type::not_found).done();
+                rep->set_status(http::reply::status_type::not_found);
                 return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
 
             });
@@ -102,9 +121,9 @@ future<std::unique_ptr<http::reply>> file_interaction_handler::read(
                 [file_name] (output_stream<char>& os) {
             return open_file_dma(file_name, open_flags::ro).then([&os] (file f) {
                 return do_with(make_file_input_stream(std::move(f)), [&os](input_stream<char>& is) {
-                    return copy(is, os).then([&os] {
+                    return copy(is, os).finally([&os] {
                         return os.close();
-                    }).then([&is] {
+                    }).finally([&is] {
                         return is.close();
                     });
                 });
@@ -119,7 +138,6 @@ bool file_interaction_handler::redirect_if_needed(const http::request& req,
     if (req._url.length() == 0 || req._url.back() != '/') {
         rep.set_status(http::reply::status_type::moved_permanently);
         rep._headers["Location"] = req.get_url() + "/";
-        rep.done();
         return true;
     }
     return false;

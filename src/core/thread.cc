@@ -1,3 +1,8 @@
+// If _FORTIFY_SOURCE is defined then longjmp ends up using longjmp_chk
+// which asserts that you're jumping to the same stack. However, here we
+// are intentionally switching stacks when longjmp'ing, so undefine this
+// option to always use normal longjmp.
+#undef _FORTIFY_SOURCE
 /*
  * This file is open source software, licensed to you under the terms
  * of the Apache License, Version 2.0 (the "License").  See the NOTICE file
@@ -19,26 +24,23 @@
 /*
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <ucontext.h>
+#ifndef SEASTAR_ASAN_ENABLED
 #include <setjmp.h>
+#endif
 #include <stdint.h>
 #include <valgrind/valgrind.h>
-#include <algorithm>
 #include <exception>
 #include <utility>
+#include <atomic>
 #include <boost/intrusive/list.hpp>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/thread.hh>
+#include <seastar/util/std-compat.hh>
 #include <seastar/core/posix.hh>
-#include <seastar/core/reactor.hh>
-#endif
+#include <seastar/core/internal/current_task.hh>
+#include <seastar/util/assert.hh>
 
 /// \cond internal
 
@@ -46,6 +48,20 @@ namespace seastar {
 
 thread_local jmp_buf_link g_unthreaded_context;
 thread_local jmp_buf_link* g_current_context;
+
+namespace {
+thread_local std::atomic_flag g_context_switch_in_progress{};
+
+inline void begin_context_switch() noexcept {
+    g_context_switch_in_progress.test_and_set(std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
+
+inline void end_context_switch() noexcept {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    g_context_switch_in_progress.clear(std::memory_order_relaxed);
+}
+}
 
 #ifdef SEASTAR_ASAN_ENABLED
 
@@ -75,6 +91,7 @@ thread_local jmp_buf_link* g_previous_context;
 
 void jmp_buf_link::initial_switch_in(ucontext_t* initial_context, const void* stack_bottom, size_t stack_size)
 {
+    begin_context_switch();
     auto prev = std::exchange(g_current_context, this);
     link = prev;
     g_previous_context = prev;
@@ -82,10 +99,12 @@ void jmp_buf_link::initial_switch_in(ucontext_t* initial_context, const void* st
     swapcontext(&prev->context, initial_context);
     __sanitizer_finish_switch_fiber(g_current_context->fake_stack, &g_previous_context->stack_bottom,
                                     &g_previous_context->stack_size);
+    end_context_switch();
 }
 
 void jmp_buf_link::switch_in()
 {
+    begin_context_switch();
     auto prev = std::exchange(g_current_context, this);
     link = prev;
     g_previous_context = prev;
@@ -93,10 +112,12 @@ void jmp_buf_link::switch_in()
     swapcontext(&prev->context, &context);
     __sanitizer_finish_switch_fiber(g_current_context->fake_stack, &g_previous_context->stack_bottom,
                                     &g_previous_context->stack_size);
+    end_context_switch();
 }
 
 void jmp_buf_link::switch_out()
 {
+    begin_context_switch();
     g_current_context = link;
     g_previous_context = this;
     __sanitizer_start_switch_fiber(&fake_stack, g_current_context->stack_bottom,
@@ -104,6 +125,7 @@ void jmp_buf_link::switch_out()
     swapcontext(&context, &g_current_context->context);
     __sanitizer_finish_switch_fiber(g_current_context->fake_stack, &g_previous_context->stack_bottom,
                                     &g_previous_context->stack_size);
+    end_context_switch();
 }
 
 void jmp_buf_link::initial_switch_in_completed()
@@ -111,10 +133,12 @@ void jmp_buf_link::initial_switch_in_completed()
     // This is a new thread and it doesn't have the fake stack yet. ASan will
     // create it lazily, for now just pass nullptr.
     __sanitizer_finish_switch_fiber(nullptr, &g_previous_context->stack_bottom, &g_previous_context->stack_size);
+    end_context_switch();
 }
 
 void jmp_buf_link::final_switch_out()
 {
+    begin_context_switch();
     g_current_context = link;
     g_previous_context = this;
     // Since the thread is about to die we pass nullptr as fake_stack_save argument
@@ -127,36 +151,44 @@ void jmp_buf_link::final_switch_out()
 
 inline void jmp_buf_link::initial_switch_in(ucontext_t* initial_context, const void*, size_t)
 {
+    begin_context_switch();
     auto prev = std::exchange(g_current_context, this);
     link = prev;
     if (setjmp(prev->jmpbuf) == 0) {
         setcontext(initial_context);
     }
+    end_context_switch();
 }
 
 inline void jmp_buf_link::switch_in()
 {
+    begin_context_switch();
     auto prev = std::exchange(g_current_context, this);
     link = prev;
     if (setjmp(prev->jmpbuf) == 0) {
         longjmp(jmpbuf, 1);
     }
+    end_context_switch();
 }
 
 inline void jmp_buf_link::switch_out()
 {
+    begin_context_switch();
     g_current_context = link;
     if (setjmp(jmpbuf) == 0) {
         longjmp(g_current_context->jmpbuf, 1);
     }
+    end_context_switch();
 }
 
 inline void jmp_buf_link::initial_switch_in_completed()
 {
+    end_context_switch();
 }
 
 inline void jmp_buf_link::final_switch_out()
 {
+    begin_context_switch();
     g_current_context = link;
     longjmp(g_current_context->jmpbuf, 1);
 }
@@ -190,7 +222,7 @@ thread_context::thread_context(thread_attributes attr, noncopyable_function<void
 thread_context::~thread_context() {
 #ifdef SEASTAR_THREAD_STACK_GUARDS
     auto mp_result = mprotect(_stack.get(), getpagesize(), PROT_READ | PROT_WRITE);
-    assert(mp_result == 0);
+    SEASTAR_ASSERT(mp_result == 0);
 #endif
     _all_threads.erase(_all_threads.iterator_to(*this));
 }
@@ -213,7 +245,7 @@ thread_context::make_stack(size_t stack_size) {
     auto stack = stack_holder(new (mem) char[stack_size], stack_deleter(valgrind_id));
 #ifdef SEASTAR_ASAN_ENABLED
     // Avoid ASAN false positive due to garbage on stack
-    std::fill_n(stack.get(), stack_size, 0);
+    std::memset(stack.get(), 0, stack_size);
 #endif
 
 #ifdef SEASTAR_THREAD_STACK_GUARDS
@@ -249,7 +281,7 @@ thread_context::setup(size_t stack_size) {
 
 void
 thread_context::switch_in() {
-    local_engine->_current_task = nullptr; // thread_wake_task is on the stack and will be invalid when we resume
+    internal::set_current_task(nullptr); // thread_wake_task is on the stack and will be invalid when we resume
     _context.switch_in();
 }
 
@@ -276,6 +308,17 @@ thread_context::yield() {
     switch_out();
 }
 
+scheduling_group
+thread_context::switch_to(scheduling_group new_sg) {
+    auto prev_sg = group();
+    if (new_sg == prev_sg) {
+        return prev_sg;
+    }
+    set_scheduling_group(new_sg);
+    yield();
+    return prev_sg;
+}
+
 void
 thread_context::reschedule() {
     schedule(this);
@@ -300,6 +343,8 @@ thread_context::main() {
     asm(".cfi_undefined x30");
 #elif defined(__s390x__)
     asm(".cfi_undefined %r14");
+#elif defined(__riscv)
+    asm(".cfi_undefined ra");
 #else
     #warning "Backtracing from seastar threads may be broken"
 #endif
@@ -331,15 +376,16 @@ void switch_out(thread_context* from) {
     from->switch_out();
 }
 
+bool is_context_switch_in_progress() noexcept {
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    return g_context_switch_in_progress.test(std::memory_order_relaxed);
+}
+
 void init() {
+    g_context_switch_in_progress.clear(std::memory_order_seq_cst);
     g_unthreaded_context.link = nullptr;
     g_unthreaded_context.thread = nullptr;
     g_current_context = &g_unthreaded_context;
-}
-
-scheduling_group
-sched_group(const thread_context* thread) {
-    return thread->group();
 }
 
 }
@@ -348,15 +394,8 @@ void thread::yield() {
     thread_impl::get()->yield();
 }
 
-bool thread::should_yield() {
-    return thread_impl::get()->should_yield();
-}
-
-void thread::maybe_yield() {
-    auto tctx = thread_impl::get();
-    if (tctx->should_yield()) {
-        tctx->yield();
-    }
+scheduling_group thread::switch_to(scheduling_group new_sg) {
+    return thread_impl::get()->switch_to(new_sg);
 }
 
 }

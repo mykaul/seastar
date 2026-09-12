@@ -22,6 +22,7 @@
 #pragma once
 
 #include <ostream>
+#include <fmt/core.h>
 
 namespace seastar {
 
@@ -67,32 +68,29 @@ public:
     constexpr explicit bool_class(bool v) noexcept : _value(v) { }
 
     /// Casts a bool_class object to an untyped \c bool.
-    explicit operator bool() const noexcept { return _value; }
+    constexpr explicit operator bool() const noexcept { return _value; }
 
     /// Logical OR.
-    friend bool_class operator||(bool_class x, bool_class y) noexcept {
+    friend constexpr bool_class operator||(bool_class x, bool_class y) noexcept {
         return bool_class(x._value || y._value);
     }
 
     /// Logical AND.
-    friend bool_class operator&&(bool_class x, bool_class y) noexcept {
+    friend constexpr bool_class operator&&(bool_class x, bool_class y) noexcept {
         return bool_class(x._value && y._value);
     }
 
     /// Logical NOT.
-    friend bool_class operator!(bool_class x) noexcept {
+    friend constexpr bool_class operator!(bool_class x) noexcept {
         return bool_class(!x._value);
     }
 
-    /// Equal-to operator.
-    friend bool operator==(bool_class x, bool_class y) noexcept {
-        return x._value == y._value;
-    }
+    /// Equal-to and not-equal-to operators.
+    friend bool operator==(bool_class x, bool_class y) noexcept = default;
 
-    /// Not-equal-to operator.
-    friend bool operator!=(bool_class x, bool_class y) noexcept {
-        return x._value != y._value;
-    }
+#if __cpp_lib_three_way_comparison
+    auto operator<=>(const bool_class& other) const noexcept = default;
+#endif
 
     /// Prints bool_class value to an output stream.
     friend std::ostream& operator<<(std::ostream& os, bool_class v) {
@@ -108,3 +106,12 @@ const bool_class<Tag> bool_class<Tag>::no { false };
 /// @}
 
 }
+
+template<typename Tag>
+struct fmt::formatter<seastar::bool_class<Tag>> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(seastar::bool_class<Tag> v, FormatContext& ctx) const{
+        return fmt::format_to(ctx.out(), "{}", bool(v));
+    }
+};

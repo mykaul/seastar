@@ -22,7 +22,6 @@
 #pragma once
 
 #include <concepts>
-#include <type_traits>
 #include <seastar/core/coroutine.hh>
 
 namespace seastar::coroutine {
@@ -35,7 +34,8 @@ struct maybe_yield_awaiter final {
     }
 
     template <typename T>
-    void await_suspend(std::coroutine_handle<T> h) {
+    void await_suspend(std::coroutine_handle<T> h SEASTAR_COROUTINE_LOC_PARAM) noexcept {
+        SEASTAR_COROUTINE_LOC_STORE(h.promise());
         schedule(&h.promise());
     }
 

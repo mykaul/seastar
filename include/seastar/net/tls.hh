@@ -20,21 +20,19 @@
  */
 #pragma once
 
-#ifndef SEASTAR_MODULE
 #include <functional>
+#include <optional>
 #include <unordered_set>
 #include <map>
-#include <boost/any.hpp>
-#endif
+#include <any>
+#include <string_view>
+#include <fmt/format.h>
 
 #include <seastar/core/future.hh>
-#include <seastar/core/internal/api-level.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/net/inet_address.hh>
-#include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
 #include <seastar/net/api.hh>
 
 namespace seastar {
@@ -55,7 +53,6 @@ class socket_address;
  * with OpenSSL or similar.
  *
  */
-SEASTAR_MODULE_EXPORT
 namespace tls {
 
     enum class x509_crt_format {
@@ -70,6 +67,11 @@ namespace tls {
     class server_credentials;
     class certificate_credentials;
     class credentials_builder;
+    class credentials_impl;
+    class dh_params_impl;
+    // allow backend friends
+    class gnutls_provider_certificate_credentials_impl;
+    class openssl_session;
 
     /**
      * Diffie-Hellman parameters for
@@ -98,10 +100,10 @@ namespace tls {
         /** loads a key from file */
         static future<dh_params> from_file(const sstring&, x509_crt_format);
     private:
-        class impl;
         friend class server_credentials;
         friend class certificate_credentials;
-        std::unique_ptr<impl> _impl;
+        friend class gnutls_provider_certificate_credentials_impl;
+        std::unique_ptr<dh_params_impl> _impl;
     };
 
     class x509_cert {
@@ -113,6 +115,15 @@ namespace tls {
         x509_cert(shared_ptr<impl>);
         shared_ptr<impl> _impl;
     };
+
+    enum class tls_version {
+        tlsv1_0,
+        tlsv1_1,
+        tlsv1_2,
+        tlsv1_3
+    };
+
+    std::string_view format_as(tls_version);
 
     class abstract_credentials {
     protected:
@@ -220,15 +231,60 @@ namespace tls {
          */
         void set_dn_verification_callback(dn_callback);
 
+        /**
+         * Optional override to disable certificate verification
+         */
+        void set_enable_certificate_verification(bool enable);
+
+        /**
+         * Set the cipher string for TLS 1.2 and below.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         *
+         * See https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_cipher_list.html
+         */
+        void set_cipher_string(const sstring&);
+
+        /**
+         * Set the cipher suites for TLS 1.3.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         *
+         * See https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_ciphersuites.html
+         */
+        void set_ciphersuites(const sstring&);
+
+        /**
+         * Enable server cipher preference order during handshake.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void enable_server_precedence();
+
+        /**
+         * Set the minimum TLS version for this connection.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void set_minimum_tls_version(tls_version);
+
+        /**
+         * Set the maximum TLS version for this connection.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void set_maximum_tls_version(tls_version);
+
+        /**
+         * Permit TLS renegotiation on TLS 1.2 and below.
+         * OpenSSL-specific; no-op for GnuTLS backend.
+         */
+        void enable_tls_renegotiation();
+
     private:
-        class impl;
         friend class session;
+        friend class openssl_session;
         friend class server_session;
         friend class server_credentials;
         friend class credentials_builder;
         template<typename Base>
         friend class reloadable_credentials;
-        shared_ptr<impl> _impl;
+        shared_ptr<credentials_impl> _impl;
     };
 
     /** Exception thrown on certificate validation error */
@@ -239,6 +295,14 @@ namespace tls {
 
     enum class client_auth {
         NONE, REQUEST, REQUIRE
+    };
+
+    /**
+     * Session resumption support.
+     * We only support TLS1.3 session tickets.
+    */
+    enum class session_resume_mode {
+        NONE, TLS13_SESSION_TICKET
     };
 
     /**
@@ -258,11 +322,27 @@ namespace tls {
         server_credentials& operator=(const server_credentials&) = delete;
 
         void set_client_auth(client_auth);
+
+        /**
+         * Sets session resume mode.
+         * If session resumption is set to TLS13 session tickets,
+         * calling this also functions as key rotation, i.e. creates
+         * a new window of TLS session keys.
+        */
+        void set_session_resume_mode(session_resume_mode);
+
+        /**
+         * Sets Application-Layer Protocol Name (ALPN) supported by the server,
+         * in preference order.
+         */
+        void set_alpn_protocols(const std::vector<sstring>& protocols);
     };
 
     class reloadable_credentials_base;
+    class credentials_builder;
 
     using reload_callback = std::function<void(const std::unordered_set<sstring>&, std::exception_ptr)>;
+    using reload_callback_ex = std::function<future<>(const credentials_builder&, const std::unordered_set<sstring>&, std::exception_ptr)>;
 
     /**
      * Intentionally "primitive", and more importantly, copyable
@@ -291,48 +371,105 @@ namespace tls {
         future<> set_system_trust();
         void set_client_auth(client_auth);
         void set_priority_string(const sstring&);
+        /**
+         * Sets session resume mode to be applied to all created server credential sets
+         * Note: setting this will generate a session key that will be reused across all
+         * built server credentials, i.e. they will share resume key.
+         * If you wish to reuse a builder to create disparate server crendentials,
+         * simply call this method again to regenerate the key.
+         */
+        void set_session_resume_mode(session_resume_mode);
+
+        /**
+         * Sets Application-Layer Protocol Name (ALPN) supported by the server,
+         * in preference order.
+         */
+        void set_alpn_protocols(const std::vector<sstring>& protocols);
+
+        // OpenSSL-specific; stored but only applied when OpenSSL backend is active.
+        void set_cipher_string(const sstring&);
+        void set_ciphersuites(const sstring&);
+        void enable_server_precedence();
+        void set_minimum_tls_version(tls_version);
+        void set_maximum_tls_version(tls_version);
+        void enable_tls_renegotiation();
 
         void apply_to(certificate_credentials&) const;
 
         shared_ptr<certificate_credentials> build_certificate_credentials() const;
         shared_ptr<server_credentials> build_server_credentials() const;
 
+        void rebuild(certificate_credentials&) const;
+        void rebuild(server_credentials&) const;
+
         // same as above, but any files used for certs/keys etc will be watched
         // for modification and reloaded if changed
-        future<shared_ptr<certificate_credentials>> build_reloadable_certificate_credentials(reload_callback = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
-        future<shared_ptr<server_credentials>> build_reloadable_server_credentials(reload_callback = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+        future<shared_ptr<certificate_credentials>> build_reloadable_certificate_credentials(reload_callback_ex = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+        future<shared_ptr<server_credentials>> build_reloadable_server_credentials(reload_callback_ex = {}, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+
+        future<shared_ptr<certificate_credentials>> build_reloadable_certificate_credentials(reload_callback, std::optional<std::chrono::milliseconds> tolerance = {}) const;
+        future<shared_ptr<server_credentials>> build_reloadable_server_credentials(reload_callback, std::optional<std::chrono::milliseconds> tolerance = {}) const;
     private:
         friend class reloadable_credentials_base;
 
-        std::multimap<sstring, boost::any> _blobs;
+        std::multimap<std::string_view, std::any> _blobs;
         client_auth _client_auth = client_auth::NONE;
+        session_resume_mode _session_resume_mode = session_resume_mode::NONE;
         sstring _priority;
+        std::vector<uint8_t> _session_resume_key;
+        std::vector<sstring> _alpn_protocols;
+        sstring _cipher_string;
+        sstring _ciphersuites;
+        bool _enable_server_precedence = false;
+        bool _enable_tls_renegotiation = false;
+        std::optional<tls_version> _min_tls_version;
+        std::optional<tls_version> _max_tls_version;
     };
+
+    using session_data = std::vector<uint8_t>;
 
     /// TLS configuration options
     struct tls_options {
+    private:
+        struct deprecated_wait_for_eof_on_shutdown {
+            bool _value = true;
+            deprecated_wait_for_eof_on_shutdown() noexcept : _value(true) {}
+            [[deprecated("Use tls::options::bye_timeout instead")]]
+            deprecated_wait_for_eof_on_shutdown(bool value) noexcept : _value(value) {}
+            [[deprecated("Use tls::options::bye_timeout instead")]]
+            void operator=(bool value) noexcept { _value = value; }
+            [[deprecated("Use tls::options::bye_timeout instead")]]
+            operator bool() const noexcept { return _value; }
+        };
+
+    public:
         /// \brief whether to wait for EOF from server on session termination
-        bool wait_for_eof_on_shutdown = true;
+        deprecated_wait_for_eof_on_shutdown wait_for_eof_on_shutdown;
         /// \brief server name to be used for the SNI TLS extension
         sstring server_name = {};
-    };
 
-    /**
-     * Creates a TLS client connection using the default network stack and the
-     * supplied credentials.
-     * Typically these should contain enough information
-     * to validate the remote certificate (i.e. trust info).
-     *
-     * ATTN: The method is going to be deprecated
-     *
-     * \param name The expected server name for the remote end point
-     */
-    /// @{
-    [[deprecated("Use overload with tls_options parameter")]]
-    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, sstring name);
-    [[deprecated("Use overload with tls_options parameter")]]
-    future<connected_socket> connect(shared_ptr<certificate_credentials>, socket_address, socket_address local, sstring name);
-    /// @}
+        /// \brief whether server certificate should be verified. May be set to false
+        /// in test environments.
+        bool verify_certificate = true;
+
+        /// \brief Optional session resume data. Must be retrieved via
+        /// get_session_resume_data below.
+        session_data session_resume_data;
+
+        /// \brief Optional list of ALPN protocols to offer to the server,
+        /// in order of preference.
+        std::vector<sstring> alpn_protocols;
+
+        // \brief Time to wait for correct session wrap-up
+        // If set to zero, the TLS-level closing is not performed, the
+        // connection is just aborted
+        std::chrono::seconds bye_timeout = std::chrono::seconds(10);
+
+        // \brief Whether or not to pick up any unread data during shutdown
+        // When false and any data arrives at the socket, the connection is
+        // immediately aborted without waiting for graceful wrap-up
+        bool wait_for_data_on_shutdown = false;
+    };
 
     /**
      * Creates a TLS client connection using the default network stack and the
@@ -353,21 +490,6 @@ namespace tls {
      * Typically these should contain enough information
      * to validate the remote certificate (i.e. trust info).
      *
-     * ATTN: The method is going to be deprecated
-     *
-     * \param name The expected server name for the remote end point
-     */
-    /// @{
-    [[deprecated("Use overload with tls_options parameter")]]
-    ::seastar::socket socket(shared_ptr<certificate_credentials>, sstring name);
-    /// @}
-
-    /**
-     * Creates a socket through which a TLS client connection can be created,
-     * using the default network stack and the supplied credentials.
-     * Typically these should contain enough information
-     * to validate the remote certificate (i.e. trust info).
-     *
      * \param options Optional additional session configuration
      */
     /// @{
@@ -377,13 +499,9 @@ namespace tls {
     /**
      * Wraps an existing connection in SSL/TLS.
      *
-     * ATTN: The method is going to be deprecated
-     *
      * \param name The expected server name for the remote end point
      */
     /// @{
-    [[deprecated("Use overload with tls_options parameter")]]
-    future<connected_socket> wrap_client(shared_ptr<certificate_credentials>, connected_socket&&, sstring name);
     future<connected_socket> wrap_server(shared_ptr<server_credentials>, connected_socket&&);
     /// @}
 
@@ -421,15 +539,22 @@ namespace tls {
     future<std::optional<session_dn>> get_dn_information(connected_socket& socket);
 
     /**
-     * Subject alt name types. 
+     * Force a re-handshake (session key renegotiotion on TLS1.3).
+     * Can only be called on a server side socket.
+     * Mainly for testing purposes.
+     */
+    future<> force_rehandshake(connected_socket& socket);
+
+    /**
+     * Subject alt name types.
     */
     enum class subject_alt_name_type {
         dnsname = 1, // string value representing a 'DNS' entry
-        rfc822name, // string value representing an 'email' entry 
+        rfc822name, // string value representing an 'email' entry
         uri, // string value representing an 'uri' entry
         ipaddress, // inet_address value representing an 'IP' entry
-        othername, // string value 
-        dn, // string value 
+        othername, // string value
+        dn, // string value
     };
 
     // Subject alt name entry
@@ -446,22 +571,83 @@ namespace tls {
      * Returns the alt name entries of matching types, or all entries if 'types' is empty
      * The values are extracted from the client authentication certificate, if available.
      * If no certificate authentication is used in the connection, en empty list is returned.
-     * 
+     *
      * If the socket is not connected a system_error exception will be thrown.
      * If the socket is not a TLS socket an exception will be thrown.
     */
     future<std::vector<subject_alt_name>> get_alt_name_information(connected_socket& socket, std::unordered_set<subject_alt_name_type> types = {});
 
+    using certificate_data = std::vector<uint8_t>;
+
+    /**
+     * Get the raw certificate (chain) that the connected peer is using.
+     * This function forces the TLS handshake. If the handshake didn't happen before the
+     * call to 'get_peer_certificate_chain' it will be completed when the returned future
+     * will become ready.
+     * The function returns the certificate chain on success. If the peer didn't send the
+     * certificate during the handshake, the function returns an empty certificate chain.
+     * If the socket is not connected the system_error exception will be thrown.
+     */
+    future<std::vector<certificate_data>> get_peer_certificate_chain(connected_socket& socket);
+
+    /**
+     * Checks if the socket was connected using session resume.
+     * Will force handshake if not already done.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+    */
+    future<bool> check_session_is_resumed(connected_socket& socket);
+
+    /**
+     * Get session resume data from a connected client socket. Will force handshake if not already done.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+     * If no session resumption data is available, returns empty buffer.
+     *
+     * Note: TLS13 session tickets most of the time require data to have been transferred
+     * between client/server. To ensure getting the session data, it is advisable to
+     * delay this call to sometime before shutting down/closing the socket.
+    */
+    future<session_data> get_session_resume_data(connected_socket&);
+
+    /**
+     * Gets the Application-Layer Protocol Name (ALPN) selected during the TLS handshake.
+     * Will force handshake if not already done.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+    */
+    future<std::optional<sstring>> get_selected_alpn_protocol(connected_socket&);
+
+    /**
+     * Returns the cipher suite used in the connection. This string depends on the internal implementation:
+     * it's e.g. "TLS_AES_256_GCM_SHA384" for gnutls and may be different for OpenSSL.
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+    */
+    future<sstring> get_cipher_suite(connected_socket& socket);
+
+    /**
+     * Returns the protocol version used in the connection, e.g. "TLS1.3"
+     *
+     * If the socket is not connected a system_error exception will be thrown.
+     * If the socket is not a TLS socket an exception will be thrown.
+    */
+    future<sstring> get_protocol_version(connected_socket& socket);
+
     std::ostream& operator<<(std::ostream&, const subject_alt_name::value_type&);
     std::ostream& operator<<(std::ostream&, const subject_alt_name&);
 
     /**
-     * Alt name to string. 
+     * Alt name to string.
      * Note: because naming of alternative names is inconsistent between tools,
      * and because openssl is probably more popular when creating certs anyway,
      * this routine will be inconsistent with both gnutls and openssl (though more
      * in line with the latter) and name the constants as follows:
-     * 
+     *
      * dnsname: "DNS"
      * rfc822name: "EMAIL"
      * uri: "URI"
@@ -469,29 +655,72 @@ namespace tls {
      * othername: "OTHERNAME"
      * dn: "DIRNAME"
     */
+    std::string_view format_as(subject_alt_name_type);
     std::ostream& operator<<(std::ostream&, subject_alt_name_type);
 
     /**
      * Error handling.
-     * 
+     *
      * The error_category instance used by exceptions thrown by TLS
      */
     const std::error_category& error_category();
 
     /**
+     * Returns the name of the active TLS backend (e.g. "gnutls", "openssl").
+     */
+    const char* backend_name();
+
+    /**
      * The more common error codes encountered in TLS.
      * Not an exhaustive list. Add exports as needed.
      */
-    extern const int ERROR_UNKNOWN_COMPRESSION_ALGORITHM;
-    extern const int ERROR_UNKNOWN_CIPHER_TYPE;
-    extern const int ERROR_INVALID_SESSION;
-    extern const int ERROR_UNEXPECTED_HANDSHAKE_PACKET;
-    extern const int ERROR_UNKNOWN_CIPHER_SUITE;
-    extern const int ERROR_UNKNOWN_ALGORITHM;
-    extern const int ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM;
-    extern const int ERROR_SAFE_RENEGOTIATION_FAILED;
-    extern const int ERROR_UNSAFE_RENEGOTIATION_DENIED;
-    extern const int ERROR_UNKNOWN_SRP_USERNAME;
-    extern const int ERROR_PREMATURE_TERMINATION;
+    extern int ERROR_UNKNOWN_COMPRESSION_ALGORITHM;
+    extern int ERROR_UNKNOWN_CIPHER_TYPE;
+    extern int ERROR_INVALID_SESSION;
+    extern int ERROR_UNEXPECTED_HANDSHAKE_PACKET;
+    extern int ERROR_UNKNOWN_CIPHER_SUITE;
+    extern int ERROR_UNKNOWN_ALGORITHM;
+    extern int ERROR_UNSUPPORTED_SIGNATURE_ALGORITHM;
+    extern int ERROR_SAFE_RENEGOTIATION_FAILED;
+    extern int ERROR_UNSAFE_RENEGOTIATION_DENIED;
+    extern int ERROR_UNKNOWN_SRP_USERNAME;
+    extern int ERROR_PREMATURE_TERMINATION;
+    extern int ERROR_PUSH;
+    extern int ERROR_PULL;
+    extern int ERROR_UNEXPECTED_PACKET;
+    extern int ERROR_UNSUPPORTED_VERSION;
+    extern int ERROR_NO_CIPHER_SUITES;
+    extern int ERROR_DECRYPTION_FAILED;
+    extern int ERROR_MAC_VERIFY_FAILED;
 }
 }
+
+template <> struct fmt::formatter<seastar::tls::tls_version> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(seastar::tls::tls_version v, FormatContext& ctx) const {
+        return formatter<string_view>::format(format_as(v), ctx);
+    }
+};
+
+template <> struct fmt::formatter<seastar::tls::subject_alt_name_type> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(seastar::tls::subject_alt_name_type type, FormatContext& ctx) const {
+        return formatter<string_view>::format(format_as(type), ctx);
+    }
+};
+
+template <> struct fmt::formatter<seastar::tls::subject_alt_name::value_type> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const seastar::tls::subject_alt_name::value_type& value, FormatContext& ctx) const {
+        return std::visit([&](const auto& v) {
+            return fmt::format_to(ctx.out(), "{}", v);
+        }, value);
+    }
+};
+
+template <> struct fmt::formatter<seastar::tls::subject_alt_name> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const seastar::tls::subject_alt_name& name, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}={}", name.type, name.value);
+    }
+};

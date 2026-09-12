@@ -21,18 +21,15 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
+#include <concepts>
 #include <type_traits>
 #include <utility>
 #include <functional>
-#include <array>
 #include <iterator>
 #include <stdint.h>
 #include <memory>
 #include <string>
 #include <tuple>
-#include <chrono>
-#endif
 
 #include <seastar/core/future.hh>
 #include <seastar/net/byteorder.hh>
@@ -40,7 +37,6 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/program-options.hh>
-#include <seastar/util/modules.hh>
 #include <seastar/core/metrics_api.hh>
 
 namespace seastar {
@@ -298,7 +294,7 @@ type_id type_id_for(known_type);
 
 using description = seastar::metrics::description;
 
-static constexpr unsigned max_collectd_field_text_len = 63;
+constexpr inline unsigned max_collectd_field_text_len = 63;
 
 class type_instance_id {
     static thread_local unsigned _next_truncated_idx;
@@ -540,41 +536,22 @@ typedef typed_value_impl<known_type::gauge> gauge;
 
 // lots of template junk to build typed value list tuples
 // for registered values.
-template<typename T, typename En = void>
+template<typename T>
 struct data_type_for;
 
-template<typename T, typename En = void>
-struct is_callable;
 
-template<typename T>
-struct is_callable<T,
-std::enable_if_t<
-!std::is_void_v<std::invoke_result_t<T>>,
-void>> : public std::true_type {
+template<std::unsigned_integral T>
+struct data_type_for<T> : public std::integral_constant<data_type, data_type::COUNTER> {
 };
 
-template<typename T>
-struct is_callable<T,
-std::enable_if_t<std::is_fundamental_v<T>, void>> : public std::false_type {
+template<std::floating_point T>
+struct data_type_for<T> : public std::integral_constant<data_type, data_type::GAUGE> {
 };
 
-template<typename T>
-struct data_type_for<T,
-std::enable_if_t<
-std::is_integral_v<T> && std::is_unsigned_v<T>,
-void>> : public std::integral_constant<data_type,
-data_type::COUNTER> {
+template<std::invocable Func>
+struct data_type_for<Func> : public data_type_for<std::invoke_result_t<Func>> {
 };
-template<typename T>
-struct data_type_for<T,
-std::enable_if_t<std::is_floating_point_v<T>, void>> : public std::integral_constant<
-data_type, data_type::GAUGE> {
-};
-template<typename T>
-struct data_type_for<T,
-std::enable_if_t<is_callable<T>::value, void>> : public data_type_for<
-std::invoke_result_t<T>> {
-};
+
 template<typename T>
 struct data_type_for<typed<T>> : public data_type_for<T> {
 };
@@ -595,7 +572,7 @@ public:
 
     typedef std::remove_reference_t<T> value_type;
     typedef std::conditional_t<
-            is_callable<std::remove_reference_t<T>>::value,
+            std::invocable<T>,
             value_type, wrap<value_type> > stored_type;
 
     value(const value_type & t)
@@ -631,15 +608,15 @@ private:
             v >>= 8;
         }
     }
-    template<typename V>
-    std::enable_if_t<std::is_integral_v<V>, uint64_t> convert(
+    template<std::integral V>
+    uint64_t convert(
             V v) const {
         uint64_t i = v;
         // network byte order
         return ntohq(i);
     }
-    template<typename V>
-    std::enable_if_t<std::is_floating_point_v<V>, uint64_t> convert(
+    template<std::floating_point V>
+    uint64_t convert(
             V t) const {
         union {
             uint64_t i;
@@ -748,7 +725,7 @@ void add_polled(const type_instance_id &, const shared_ptr<value_list> &, bool e
 
 typedef std::function<void()> notify_function;
 template<typename... _Args>
-static auto make_type_instance(description d, _Args && ... args) -> values_impl < decltype(value<_Args>(std::forward<_Args>(args)))... >
+auto make_type_instance(description d, _Args && ... args) -> values_impl < decltype(value<_Args>(std::forward<_Args>(args)))... >
 {
     return values_impl<decltype(value<_Args>(std::forward<_Args>(args)))...>(
                     std::move(d), value<_Args>(std::forward<_Args>(args))...);
@@ -758,7 +735,7 @@ static auto make_type_instance(description d, _Args && ... args) -> values_impl 
  *
  */
 template<typename ... _Args>
-[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const plugin_id & plugin,
+[[deprecated("Use the metrics layer")]] type_instance_id add_polled_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, _Args&& ... args) {
     return add_polled_metric(plugin, plugin_instance, type, type_instance, description(),
@@ -769,7 +746,7 @@ template<typename ... _Args>
  *
  */
 template<typename ... _Args>
-[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const plugin_id & plugin,
+[[deprecated("Use the metrics layer")]] type_instance_id add_polled_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, description d, _Args&& ... args) {
     return add_polled_metric(
@@ -777,7 +754,7 @@ template<typename ... _Args>
             std::forward<_Args>(args)...);
 }
 template<typename ... _Args>
-static future<> send_explicit_metric(const plugin_id & plugin,
+future<> send_explicit_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, _Args&& ... args) {
     return send_explicit_metric(
@@ -785,7 +762,7 @@ static future<> send_explicit_metric(const plugin_id & plugin,
             std::forward<_Args>(args)...);
 }
 template<typename ... _Args>
-static notify_function create_explicit_metric(const plugin_id & plugin,
+notify_function create_explicit_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, _Args&& ... args) {
     return create_explicit_metric(
@@ -799,7 +776,7 @@ seastar::metrics::impl::metric_id to_metrics_id(const type_instance_id & id);
  *
  */
 template<typename Arg>
-[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const type_instance_id & id, description d,
+[[deprecated("Use the metrics layer")]] type_instance_id add_polled_metric(const type_instance_id & id, description d,
         Arg&& arg, bool enabled = true) {
     seastar::metrics::impl::get_local_impl()->add_registration(to_metrics_id(id), arg.type, seastar::metrics::impl::make_function(arg.value, arg.type), d, enabled);
     return id;
@@ -809,7 +786,7 @@ template<typename Arg>
  *
  */
 template<typename Arg>
-[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const type_instance_id & id,
+[[deprecated("Use the metrics layer")]] type_instance_id add_polled_metric(const type_instance_id & id,
         Arg&& arg) {
     return std::move(add_polled_metric(id, description(), std::forward<Arg>(arg)));
 }
@@ -819,19 +796,19 @@ template<typename Arg>
  *
  */
 template<typename Args>
-[[deprecated("Use the metrics layer")]] static type_instance_id add_disabled_polled_metric(const type_instance_id & id, description d,
+[[deprecated("Use the metrics layer")]] type_instance_id add_disabled_polled_metric(const type_instance_id & id, description d,
         Args&& arg) {
     return add_polled_metric(id, d, std::forward<Args>(arg), false);
 }
 
 template<typename Args>
-static type_instance_id add_disabled_polled_metric(const type_instance_id & id,
+type_instance_id add_disabled_polled_metric(const type_instance_id & id,
         Args&& args) {
     return add_disabled_polled_metric(id, description(), std::forward<Args>(args));
 }
 
 template<typename ... Args>
-static type_instance_id add_disabled_polled_metric(const type_instance_id & id,
+type_instance_id add_disabled_polled_metric(const type_instance_id & id,
         Args&& ... args) {
     return add_disabled_polled_metric(id, description(), std::forward<Args>(args)...);
 }
@@ -839,12 +816,12 @@ static type_instance_id add_disabled_polled_metric(const type_instance_id & id,
 // "Explicit" metric sends. Sends a single value list as a message.
 // Obviously not super efficient either. But maybe someone needs it sometime.
 template<typename ... _Args>
-static future<> send_explicit_metric(const type_instance_id & id,
+future<> send_explicit_metric(const type_instance_id & id,
         _Args&& ... args) {
     return send_metric(id, make_type_instance(std::forward<_Args>(args)...));
 }
 template<typename ... _Args>
-static notify_function create_explicit_metric(const type_instance_id & id,
+notify_function create_explicit_metric(const type_instance_id & id,
         _Args&& ... args) {
     auto list = make_type_instance(std::forward<_Args>(args)...);
     return [id, list=std::move(list)]() {

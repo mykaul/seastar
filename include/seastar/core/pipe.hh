@@ -24,9 +24,6 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/queue.hh>
 
-#include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
-
 /// \defgroup fiber-module Fibers
 ///
 /// \brief Fibers of execution
@@ -65,7 +62,6 @@ namespace seastar {
 
 /// \addtogroup fiber-module
 /// @{
-SEASTAR_MODULE_EXPORT
 class broken_pipe_exception : public std::exception {
 public:
     virtual const char* what() const noexcept {
@@ -73,7 +69,6 @@ public:
     }
 };
 
-SEASTAR_MODULE_EXPORT
 class unread_overflow_exception : public std::exception {
 public:
     virtual const char* what() const noexcept {
@@ -126,7 +121,6 @@ public:
 } // namespace internal
 /// \endcond
 
-SEASTAR_MODULE_EXPORT_BEGIN
 template <typename T>
 class pipe;
 
@@ -268,7 +262,6 @@ private:
     pipe(internal::pipe_buffer<T> *bufp) noexcept : reader(bufp), writer(bufp) { }
 };
 
-SEASTAR_MODULE_EXPORT_END
 
 /// @}
 
