@@ -1,15 +1,15 @@
 Seastar Native TCP/IP Stack
 ---------------------------
 
-Seastar comes with a native, sharded TCP/IP stack.  Usually it is used with the [DPDK](building-dpdk.md) environment, but there are also vhost drivers for testing in a development environment.
+Seastar comes with a native, sharded TCP/IP stack. It is usually used with the [DPDK](building-dpdk.md) environment, but vhost drivers are also available for testing in a development environment.
 
-To enable the native network stack, pass the `--network-stack native` parameter to a seastar application.
+To enable the native network stack, pass the `--network-stack native` option to a Seastar application.
 
-To test the native stack without dpdk, install and start the `libvirt` daemon.  This will create a bridge device named `virbr0`, which seastar will connect to.
+To test the native stack without DPDK, install and start the `libvirt` daemon. This creates a bridge device named `virbr0`, to which Seastar will connect.
 
-Seastar's vhost driver will need a tap device to connect to.  The scripts `scripts/tap.sh` will set up a tap device and bind it to `virbr0`:
+Seastar's vhost driver needs a tap device. The `scripts/tap.sh` script sets up a tap device and binds it to `virbr0`:
 
-	$ sh ./scripts/tap.sh 
+	$ sh ./scripts/tap.sh
 	Set 'tap0' nonpersistent
 	bridge name	bridge id		STP enabled	interfaces
 	virbr0		8000.5254008be729	no		tap0
@@ -22,7 +22,7 @@ Seastar's vhost driver will need a tap device to connect to.  The scripts `scrip
 	        TX packets 547098  bytes 2508723098 (2.3 GiB)
 	        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
 
-You can now run a seastar application; for example, the http server:
+You can now run a Seastar application; for example, the HTTP server:
 
 	$ ./build/release/apps/httpd/httpd --network-stack native
 	DHCP sending discover
@@ -48,7 +48,6 @@ You can now ping the IP address shown (`192.168.122.18`) or connect to it:
 	--- 192.168.122.18 ping statistics ---
 	6 packets transmitted, 6 received, 0% packet loss, time 4999ms
 	rtt min/avg/max/mdev = 0.093/0.116/0.160/0.023 ms
-	
-	$ curl http://192.168.122.18:10000/
-	"hello" 
 
+	$ curl http://192.168.122.18:10000/
+	"hello"

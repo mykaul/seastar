@@ -1,4 +1,3 @@
-#
 # This file is open source software, licensed to you under the terms
 # of the Apache License, Version 2.0 (the "License").  See the NOTICE file
 # distributed with this work for additional information regarding copyright
@@ -53,5 +52,7 @@ add_subdirectory (httpd)
 add_subdirectory (io_tester)
 add_subdirectory (rpc_tester)
 add_subdirectory (iotune)
-add_subdirectory (memcached)
+if (${Seastar_API_LEVEL} GREATER_EQUAL 9)
+  add_subdirectory (memcached)
+endif ()
 add_subdirectory (seawreck)

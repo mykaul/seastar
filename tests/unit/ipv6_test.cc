@@ -60,12 +60,30 @@ SEASTAR_TEST_CASE(udp_packet_test) {
             auto a = sc.local_address();
             sc.close();
             BOOST_REQUIRE_EQUAL(src, pkt.get_src());
-            auto dst = pkt.get_dst();
-            // Don't always get a dst address.
-            if (dst != socket_address()) {
-                BOOST_REQUIRE_EQUAL(a, pkt.get_dst());
-            }
+            BOOST_REQUIRE_EQUAL(pkt.get_src().length(), sizeof(::sockaddr_in6));
+            BOOST_REQUIRE_EQUAL(a, pkt.get_dst());
         });
+    });
+}
+
+SEASTAR_TEST_CASE(udp_wildcard_dst_test) {
+    if (!check_ipv6_support()) {
+        return make_ready_future<>();
+    }
+
+    return async([] {
+        auto sc = make_bound_datagram_channel(ipv6_addr{"::"});
+        auto cc = make_bound_datagram_channel(ipv6_addr{"::1"});
+        socket_address dst(ipv6_addr{"::1", sc.local_address().port()});
+
+        cc.send(dst, "apa").get();
+        auto pkt = sc.receive().get();
+
+        BOOST_REQUIRE_EQUAL(pkt.get_src(), cc.local_address());
+        BOOST_REQUIRE_EQUAL(pkt.get_dst(), dst);
+
+        cc.close();
+        sc.close();
     });
 }
 
@@ -80,8 +98,8 @@ SEASTAR_TEST_CASE(tcp_packet_test) {
 
         BOOST_REQUIRE(la.addr().is_ipv6());
 
-        auto cc = connect(la).get0();
-        auto lc = std::move(sc.accept().get0().connection);
+        auto cc = connect(la).get();
+        auto lc = std::move(sc.accept().get().connection);
 
         auto strm = cc.output();
         strm.write("los lobos").get();
@@ -101,5 +119,28 @@ SEASTAR_TEST_CASE(tcp_packet_test) {
         in.close().get();
         sc.abort_accept();
     });
+}
+
+SEASTAR_TEST_CASE(ipv6_equal_test) {
+    const uint16_t port{8080};
+    const uint16_t port2{8088};
+
+    const std::string str_addr1{"abcd:fedc:ba98:7654:3210:0123:4567:89ab"};
+    const std::string str_addr2{"0123:4567:89ab:cdef:3210:0123:4567:89ab"};
+    const std::string str_addr3{"abcd:fedc:ba98:7654:3210:0123:4567:8900"};
+
+    socket_address sock_addr1(ipv6_addr(str_addr1, port));
+    socket_address sock_addr2(ipv6_addr(str_addr2, port));
+    socket_address sock_addr3(ipv6_addr(str_addr1, port));
+
+    socket_address sock_addr4(ipv6_addr(str_addr3, port));
+    socket_address sock_addr5(ipv6_addr(str_addr1, port2));
+
+    BOOST_CHECK_NE(sock_addr1, sock_addr2);
+    BOOST_CHECK_EQUAL(sock_addr1, sock_addr3);
+    BOOST_CHECK_NE(sock_addr1, sock_addr4);
+    BOOST_CHECK_NE(sock_addr1, sock_addr5);
+
+    return make_ready_future();
 }
 

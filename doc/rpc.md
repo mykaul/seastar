@@ -2,12 +2,12 @@
 
 ## Data encoding
 
-All integral data is encoded in little endian format.
+All integral data is encoded in little-endian format.
 
 ## Protocol negotiation
 
-The negotiation works by exchanging negotiation frame immediately after connection establishment. The negotiation frame format is:
-    
+Negotiation works by exchanging a negotiation frame immediately after the connection is established. The negotiation frame format is:
+
     uint8_t magic[8] = SSTARRPC
     uint32_t len
     uint8_t data[len]
@@ -22,9 +22,9 @@ The negotiation frame data is itself composed of multiple records, one for each 
      }
 
 A `negotiation_frame_feature_record` signals that an optional feature is present in the client, and can contain additional feature-specific data.  The feature number will be omitted in a server response if an optional feature is declined by the server.
-    
+
 Actual negotiation looks like this:
-    
+
          Client                                  Server
     --------------------------------------------------------------------------------------------------
     send negotiation frame
@@ -42,36 +42,36 @@ Actual negotiation looks like this:
                      provided by an application. Compressor factory is
                      responsible for negotiation of compression algorithm.
 
-    If compression is negotiated request and response frames are encapsulated in a compressed frame.
+    If compression is negotiated, request and response frames are encapsulated in a compressed frame.
 
 #### Timeout propagation
     feature_number:  1
     data          :  none
 
-    If timeout propagation is negotiated request frame has additional 8 bytes that hold timeout value
-    for a request in milliseconds. Zero value means that timeout value was not specified.
-    If timeout is specified and server cannot handle the request in specified time frame it my choose
-    to not send the reply back (sending it back will not be an error either).
+    If timeout propagation is negotiated, the request frame has an additional 8 bytes that hold the
+    timeout value in milliseconds. A value of zero means that no timeout was specified.
+    If a timeout is specified and the server cannot handle the request within that time, it may choose
+    not to send a reply (sending one is not an error either).
 
 #### Connection ID
     feature_number: 2
-    uint64_t conenction_id  : RPC connection ID 
+    uint64_t connection_id  : RPC connection ID
 
-    Server assigns unique connection ID for each connection and sends it to a client using
+    The server assigns a unique connection ID to each connection and sends it to the client using
     this feature.
 
 #### Stream parent
     feature_number: 3
     uint64_t connection_id : RPC connection ID representing a parent of the stream
 
-    If this feature is present it means that the connection is not regular RPC connection
-    but stream connection. If parent connection is closed or aborted all streams belonging 
+    If this feature is present, the connection is a stream connection rather than a regular RPC
+    connection. If the parent connection is closed or aborted, all streams belonging
     to it will be closed as well.
-   
-    Stream connection is a connection that allows bidirectional flow of bytes which may carry one or
-    more messages in each direction. Stream connection should be explicitly closed by both client and
-    server. Closing is done by sending special EOS frame (described below).
-    
+
+    A stream connection allows a bidirectional flow of bytes that may carry one or more messages in
+    each direction. A stream connection should be explicitly closed by both the client and the server.
+    Closing is done by sending a special EOS frame (described below).
+
 
 #### Isolation
     feature number: 4
@@ -86,11 +86,25 @@ Actual negotiation looks like this:
     The server does not directly assign meaning to values of `isolation_cookie`;
     instead, the interpretation is left to user code.
 
+#### Handler duration
+    feature number: 5
+    data: none
+
+    Asks server to send "extended" response that includes the handler duration time. See
+    the response frame description for more details
+
+
 ##### Compressed frame format
     uint32_t len
     uint8_t compressed_data[len]
 
-    after compressed_data is uncompressed it becomes regular request, response or streaming frame 
+    After compressed_data is uncompressed, it becomes a regular request, response or streaming frame.
+
+    As a special case, it is allowed to send a compressed frame of size 0 (pre-compression).
+    Such a frame will be a no-op on the receiver.
+    (This can be used as a means of communication between the compressors themselves.
+    If a compressor wants to send some metadata to its peer, it can send a no-op frame,
+    and prepend the metadata as a compressor-specific header.)
 
 ## Request frame format
     uint64_t timeout_in_ms - only present if timeout propagation is negotiated
@@ -99,23 +113,27 @@ Actual negotiation looks like this:
     uint32_t len
     uint8_t data[len]
 
-msg_id has to be positive and may never be reused.
-data is transparent for the protocol and serialized/deserialized by a user 
+`msg_id` must be positive and must never be reused.
+`data` is transparent to the protocol and is serialized/deserialized by the user.
 
 ## Response frame format
     int64_t msg_id
     uint32_t len
+    uint32_t handler_duration - present if handler duration is negotiated
     uint8_t data[len]
-    
-if msg_id < 0 enclosed response contains an exception that came as a response to msg id abs(msg_id)
-data is transparent for the protocol and serialized/deserialized by a user 
+
+If `msg_id < 0`, the enclosed response contains an exception returned for message ID `abs(msg_id)`.
+`data` is transparent to the protocol and is serialized/deserialized by the user.
+
+`handler_duration` is in microseconds. A value of `0xffffffff` means that it was not measured
+and should be disregarded by the client.
 
 ## Stream frame format
    uint32_t len
    uint8_t data[len]
 
-len == 0xffffffff signals end of stream
-data is transparent for the protocol and serialized/deserialized by a user 
+`len == 0xffffffff` signals the end of the stream.
+`data` is transparent to the protocol and is serialized/deserialized by the user.
 
 ## Exception encoding
     uint32_t type
@@ -125,20 +143,20 @@ data is transparent for the protocol and serialized/deserialized by a user
 ### Known exception types
     USER = 0
     UNKNOWN_VERB = 1
-    
+
 #### USER exception encoding
 
     uint32_t len
     char[len]
 
-This exception is sent as a reply if rpc handler throws an exception.
-It is delivered to a caller as rpc::remote_verb_error(char[len])
+This exception is sent as a reply if an RPC handler throws an exception.
+It is delivered to the caller as `rpc::remote_verb_error(char[len])`.
 
 #### UNKNOWN_VERB exception encoding
 
     uint64_t verb_id
-    
-This exception is sent as a response to a request with unknown verb_id, the verb id is passed back as part of the exception payload.
+
+This exception is sent in response to a request with an unknown `verb_id`; the verb ID is returned as part of the exception payload.
 
 ## More formal protocol description
 
@@ -164,7 +182,6 @@ This exception is sent as a response to a request with unknown verb_id, the verb
 	negotiation_frame = 'SSTARRPC' len32(negotiation_frame_data) negotiation_frame_data
 	negotiation_frame_data = negotiation_frame_feature_record*
 	negotiation_frame_feature_record = feature_number len {byte}*len
-	feature_number = uint32_t 
+	feature_number = uint32_t
 
 Note that replies can come in order different from requests, and some requests may not have a reply at all.
-

@@ -21,15 +21,7 @@
 
 #pragma once
 
-#include <seastar/util/modules.hh>
 
-#ifndef SEASTAR_MODULE
-
-#include <optional>
-#include <string_view>
-#include <variant>
-
-#include <filesystem>
 
 #if __has_include(<memory_resource>)
 #include <memory_resource>
@@ -40,13 +32,7 @@ namespace std::pmr {
 }
 #endif
 
-#if defined(__cpp_impl_coroutine) || defined(__cpp_coroutines)
-#if __has_include(<coroutine>)
-#define SEASTAR_COROUTINES_ENABLED
-#else
-#error Please use a C++ compiler with C++20 coroutines support
-#endif
-#endif
+#include <source_location>
 
 // Defining SEASTAR_ASAN_ENABLED in here is a bit of a hack, but
 // convenient since it is build system independent and in practice
@@ -61,30 +47,52 @@ namespace std::pmr {
 #define SEASTAR_ASAN_ENABLED
 #endif
 
-#if __has_include(<source_location>)
-#include <source_location>
-#endif
-
-#if defined(__cpp_lib_source_location) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
-// good
-#elif __has_include(<experimental/source_location>) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
-#include <experimental/source_location>
-#else
-#include <seastar/util/source_location-compat.hh>
-#endif
-
-#endif // !defined(SEASTAR_MODULE)
-
 namespace seastar::compat {
-SEASTAR_MODULE_EXPORT_BEGIN
 
-#if defined(__cpp_lib_source_location) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
-using source_location = std::source_location;
-#elif __has_include(<experimental/source_location>) && !defined(SEASTAR_BROKEN_SOURCE_LOCATION)
-using source_location = std::experimental::source_location;
+// Deprecated: use std::source_location directly.
+// This alias is maintained for backwards compatibility with external users.
+using source_location
+    [[deprecated("Use std::source_location instead of seastar::compat::source_location")]]
+    = std::source_location;
+
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC Workaround: Strip source_location to prevent ICE during RTL expansion.
+// See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=114675
+#define SEASTAR_COROUTINE_LOC_PARAM
+#define SEASTAR_COROUTINE_LOC_STORE(promise) (void)0
 #else
-using source_location = seastar::internal::source_location;
+// Standard/Clang: Capture source location naturally.
+// Includes the leading comma to mix cleanly into argument lists.
+#define SEASTAR_COROUTINE_LOC_PARAM \
+    , std::source_location sl = std::source_location::current()
+
+#define SEASTAR_COROUTINE_LOC_STORE(promise) \
+    (promise).update_resume_point(sl)
 #endif
 
-SEASTAR_MODULE_EXPORT_END
-}
+// Coroutine LLVM HALO support.
+#if defined(__clang__) && __clang_major__ >= 23 && defined(__has_cpp_attribute)
+  #if __has_cpp_attribute(clang::coro_await_elidable)
+    #define SEASTAR_CORO_AWAIT_ELIDABLE [[clang::coro_await_elidable]]
+  #else
+    #define SEASTAR_CORO_AWAIT_ELIDABLE
+  #endif
+
+  #if __has_cpp_attribute(clang::coro_only_destroy_when_complete)
+    #define SEASTAR_CORO_ONLY_DESTROY_WHEN_COMPLETE [[clang::coro_only_destroy_when_complete]]
+  #else
+    #define SEASTAR_CORO_ONLY_DESTROY_WHEN_COMPLETE
+  #endif
+
+  #if __has_cpp_attribute(clang::coro_await_elidable_argument)
+    #define SEASTAR_CORO_AWAIT_ELIDABLE_ARGUMENT [[clang::coro_await_elidable_argument]]
+  #else
+    #define SEASTAR_CORO_AWAIT_ELIDABLE_ARGUMENT
+  #endif
+#else
+  #define SEASTAR_CORO_AWAIT_ELIDABLE
+  #define SEASTAR_CORO_ONLY_DESTROY_WHEN_COMPLETE
+  #define SEASTAR_CORO_AWAIT_ELIDABLE_ARGUMENT
+#endif

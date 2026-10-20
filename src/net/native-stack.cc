@@ -19,11 +19,7 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#include <cassert>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -32,19 +28,11 @@ module;
 #include <optional>
 #include <queue>
 
-#include <sys/types.h>
+#include <seastar/util/assert.hh>
+
 #include <sys/stat.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 
-#ifdef HAVE_OSV
-#include <osv/firmware.hh>
-#include <gnu/libc-version.h>
-#endif
-
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/net/native-stack.hh>
 #include "net/native-stack-impl.hh"
 #include <seastar/net/net.hh>
@@ -58,7 +46,6 @@ module seastar;
 #include <seastar/net/dhcp.hh>
 #include <seastar/net/config.hh>
 #include <seastar/core/reactor.hh>
-#endif
 
 namespace seastar {
 
@@ -87,30 +74,30 @@ void create_native_net_device(const native_stack_options& opts) {
     if ( deprecated_config_used) {
 #ifdef SEASTAR_HAVE_DPDK
         if ( opts.dpdk_pmd) {
-             dev = create_dpdk_net_device(opts.dpdk_opts.dpdk_port_index.get_value(), smp::count,
+             dev = create_dpdk_net_device(opts.dpdk_opts.dpdk_port_index.get_value(), this_smp_shard_count(),
                 !(opts.lro && opts.lro.get_value() == "off"),
                 !(opts.dpdk_opts.hw_fc && opts.dpdk_opts.hw_fc.get_value() == "off"));
-       } else 
-#endif  
+       } else
+#endif
         dev = create_virtio_net_device(opts.virtio_opts, opts.lro);
     }
     else {
         auto device_configs = parse_config(net_config);
 
         if ( device_configs.size() > 1) {
-            std::runtime_error("only one network interface is supported");
+            throw std::runtime_error("only one network interface is supported");
         }
 
         for ( auto&& device_config : device_configs) {
-            auto& hw_config = device_config.second.hw_cfg;   
+            auto& hw_config = device_config.second.hw_cfg;
 #ifdef SEASTAR_HAVE_DPDK
             if ( hw_config.port_index || !hw_config.pci_address.empty() ) {
 	            dev = create_dpdk_net_device(hw_config);
-	        } else 
-#endif  
+	        } else
+#endif
             {
-                (void)hw_config;        
-                std::runtime_error("only DPDK supports new configuration format"); 
+                (void)hw_config;
+                throw std::runtime_error("only DPDK supports new configuration format");
             }
         }
     }
@@ -120,13 +107,13 @@ void create_native_net_device(const native_stack_options& opts) {
     // set_local_queue on all shard in the background,
     // signal when done.
     // FIXME: handle exceptions
-    for (unsigned i = 0; i < smp::count; i++) {
+    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
         (void)smp::submit_to(i, [&opts, sdev] {
             uint16_t qid = this_shard_id();
             if (qid < sdev->hw_queues_count()) {
                 auto qp = sdev->init_local_queue(opts, qid);
                 std::map<unsigned, float> cpu_weights;
-                for (unsigned i = sdev->hw_queues_count() + qid % sdev->hw_queues_count(); i < smp::count; i+= sdev->hw_queues_count()) {
+                for (unsigned i = sdev->hw_queues_count() + qid % sdev->hw_queues_count(); i < this_smp_shard_count(); i+= sdev->hw_queues_count()) {
                     cpu_weights[i] = 1;
                 }
                 cpu_weights[qid] = opts.hw_queue_weight.get_value();
@@ -143,10 +130,10 @@ void create_native_net_device(const native_stack_options& opts) {
     // wait for all shards to set their local queue,
     // then when link is ready, communicate the native_stack to the caller
     // via `create_native_stack` (that sets the ready_promise value)
-    (void)sem->wait(smp::count).then([&opts, sdev] {
+    (void)sem->wait(this_smp_shard_count()).then([&opts, sdev] {
         // FIXME: future is discarded
         (void)sdev->link_ready().then([&opts, sdev] {
-            for (unsigned i = 0; i < smp::count; i++) {
+            for (unsigned i = 0; i < this_smp_shard_count(); i++) {
                 // FIXME: future is discarded
                 (void)smp::submit_to(i, [&opts, sdev] {
                     create_native_stack(opts, sdev);
@@ -177,13 +164,12 @@ public:
     explicit native_network_stack(const native_stack_options& opts, std::shared_ptr<device> dev);
     virtual server_socket listen(socket_address sa, listen_options opt) override;
     virtual ::seastar::socket socket() override;
-    virtual udp_channel make_udp_channel(const socket_address& addr) override;
     virtual net::datagram_channel make_unbound_datagram_channel(sa_family_t) override;
     virtual net::datagram_channel make_bound_datagram_channel(const socket_address& local) override;
     virtual future<> initialize() override;
     static future<std::unique_ptr<network_stack>> create(const program_options::option_group& opts) {
         auto ns_opts = dynamic_cast<const native_stack_options*>(&opts);
-        assert(ns_opts);
+        SEASTAR_ASSERT(ns_opts);
         if (this_shard_id() == 0) {
             create_native_net_device(*ns_opts);
         }
@@ -199,14 +185,21 @@ public:
     friend class native_network_interface;
 
     std::vector<network_interface> network_interfaces() override;
+
+    virtual statistics stats(unsigned scheduling_group_id) override {
+        return statistics{
+            internal::native_stack_net_stats::bytes_sent[scheduling_group_id],
+            internal::native_stack_net_stats::bytes_received[scheduling_group_id],
+        };
+    }
+
+    virtual void clear_stats(unsigned scheduling_group_id) override {
+        internal::native_stack_net_stats::bytes_sent[scheduling_group_id] = 0;
+        internal::native_stack_net_stats::bytes_received[scheduling_group_id] = 0;
+    }
 };
 
 thread_local promise<std::unique_ptr<network_stack>> native_network_stack::ready_promise;
-
-udp_channel
-native_network_stack::make_udp_channel(const socket_address& addr) {
-    return _inet.get_udp().make_channel(addr);
-}
 
 net::datagram_channel native_network_stack::make_unbound_datagram_channel(sa_family_t family) {
     if (family != AF_INET) {
@@ -236,7 +229,7 @@ native_network_stack::native_network_stack(const native_stack_options& opts, std
 
 server_socket
 native_network_stack::listen(socket_address sa, listen_options opts) {
-    assert(sa.family() == AF_INET || sa.is_unspecified());
+    SEASTAR_ASSERT(sa.family() == AF_INET || sa.is_unspecified());
     return tcpv4_listen(_inet.get_tcp(), ntohs(sa.as_posix_sockaddr_in().sin_port), opts);
 }
 
@@ -279,7 +272,7 @@ void native_network_stack::on_dhcp(std::optional<dhcp::lease> lease, bool is_ren
     if (this_shard_id() == 0) {
         // And the other cpus, which, in the case of initial discovery,
         // will be waiting for us.
-        for (unsigned i = 1; i < smp::count; i++) {
+        for (unsigned i = 1; i < this_smp_shard_count(); i++) {
             (void)smp::submit_to(i, [lease, is_renew]() {
                 auto & ns = static_cast<native_network_stack&>(engine().net());
                 ns.on_dhcp(lease, is_renew);
@@ -401,13 +394,13 @@ public:
         return name();
     }
     const std::vector<net::inet_address>& addresses() const override {
-        return _addresses;            
+        return _addresses;
     }
     const std::vector<uint8_t> hardware_address() const override {
         return _hardware_address;
     }
     bool is_loopback() const override {
-        return false;   
+        return false;
     }
     bool is_virtual() const override {
         return false;
@@ -432,6 +425,6 @@ std::vector<network_interface> native_network_stack::network_interfaces() {
     return res;
 }
 
-}
+} // namespace net
 
 }

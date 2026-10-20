@@ -22,28 +22,19 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
 #include <sys/types.h>
-#include <algorithm>
 #include <filesystem>
-#include <initializer_list>
-#include <iterator>
-#include <string_view>
-#include <utility>
 #include <variant>
 #include <vector>
-#include <fmt/format.h>
-#endif
 #include <seastar/core/iostream.hh>
 #include <seastar/core/posix.hh>
 #include <seastar/core/sstring.hh>
 
-namespace seastar::experimental {
+namespace seastar {
 
 /// The optional parameters for spawning a subprocess
 ///
 /// \note see \c execve(2) for more details on \c argv and \c env.
-SEASTAR_MODULE_EXPORT
 struct spawn_parameters {
     /// The arguments passed to the program
     std::vector<sstring> argv;
@@ -56,7 +47,6 @@ struct spawn_parameters {
 /// \note the spawned subprocess should always be \c wait()'ed. Otherwise,
 /// the Seastar application spawning the subprocess will leave us with
 /// one ore more zombie subprocesses after it exists.
-SEASTAR_MODULE_EXPORT
 class process {
     struct create_tag {};
     /// Spawn a subprocess using \c posix_spawn(3)
@@ -75,6 +65,8 @@ class process {
     static future<process> spawn(const std::filesystem::path& pathname);
 public:
     process(create_tag, pid_t pid, file_desc&& cin, file_desc&& cout, file_desc&& cerr);
+    /// Return the process ID of the child process
+    pid_t pid() const { return _pid; }
     /// Return an writable stream which provides input from the child process
     output_stream<char> cin();
     /// Return an writable stream which provides stdout output from the child process
@@ -107,4 +99,12 @@ private:
                                          spawn_parameters);
     friend future<process> spawn_process(const std::filesystem::path&);
 };
+
+namespace experimental {
+/// \deprecated Use \c seastar::process instead
+using seastar::process;
+/// \deprecated Use \c seastar::spawn_parameters instead
+using seastar::spawn_parameters;
+}
+
 }

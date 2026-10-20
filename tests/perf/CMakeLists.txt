@@ -80,5 +80,40 @@ seastar_add_test (smp_submit_to
   SOURCES smp_submit_to_perf.cc
   NO_SEASTAR_PERF_TESTING_LIBRARY)
 
+seastar_add_test (io_queue_latency
+    SOURCES io_queue_latency.cc
+    NO_SEASTAR_PERF_TESTING_LIBRARY)
+
+seastar_add_test (thread_context_switch
+  SOURCES thread_context_switch_test.cc
+  NO_SEASTAR_PERF_TESTING_LIBRARY)
+
 seastar_add_test (coroutine
   SOURCES coroutine_perf.cc)
+
+seastar_add_test (allocator
+  SOURCES allocator_perf.cc)
+
+seastar_add_test (container
+  SOURCES container_perf.cc)
+
+seastar_add_test (http_client
+  SOURCES http_client_perf.cc linux_perf_event.cc
+  NO_SEASTAR_PERF_TESTING_LIBRARY)
+
+seastar_add_test (perf_tests
+  SOURCES perf_tests_perf.cc)
+
+seastar_add_test (metrics
+  SOURCES metrics_perf.cc)
+
+if (Seastar_LTTNG)
+  add_executable (test_perf_lttng_overhead lttng_overhead_perf.cc)
+  target_include_directories (test_perf_lttng_overhead
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries (test_perf_lttng_overhead
+    PRIVATE LTTng::UST)
+  set_target_properties (test_perf_lttng_overhead
+    PROPERTIES OUTPUT_NAME lttng_overhead_perf)
+  add_dependencies (perf_tests test_perf_lttng_overhead)
+endif ()

@@ -22,16 +22,10 @@
 #pragma once
 
 #include <seastar/core/future.hh>
-#include <seastar/util/modules.hh>
-#ifndef SEASTAR_MODULE
 #include <exception>
-#include <functional>
-#include <cassert>
-#endif
 
 namespace seastar {
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 // A stream/subscription pair is similar to a promise/future pair,
 // but apply to a sequence of values instead of a single value.
@@ -152,7 +146,6 @@ public:
 
     friend class stream<T...>;
 };
-SEASTAR_MODULE_EXPORT_END
 
 template <typename... T>
 inline

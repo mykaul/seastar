@@ -21,17 +21,15 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
+#include <seastar/core/iostream.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/eclipse.hh>
 #include <algorithm>
 #include <memory>
 #include <cassert>
-#include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
 #include <seastar/core/future.hh>
-#endif
 
 namespace seastar {
 
@@ -94,7 +92,6 @@ public:
     }
 };
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 // CRTP
 template <typename ConcreteParser>
@@ -116,7 +113,7 @@ protected:
         if (_fsm_top == _fsm_stack_size) {
             auto old = _fsm_stack_size;
             _fsm_stack_size = std::max(_fsm_stack_size * 2, 16);
-            assert(_fsm_stack_size > old);
+            SEASTAR_ASSERT(_fsm_stack_size > old);
             std::unique_ptr<int[]> new_stack{new int[_fsm_stack_size]};
             std::copy(_fsm_stack.get(), _fsm_stack.get() + _fsm_top, new_stack.get());
             std::swap(_fsm_stack, new_stack);
@@ -127,17 +124,16 @@ protected:
         return std::move(_builder).get();
     }
 public:
-    using unconsumed_remainder = std::optional<temporary_buffer<char>>;
-    future<unconsumed_remainder> operator()(temporary_buffer<char> buf) {
+    future<consumption_result<char>> operator()(temporary_buffer<char> buf) {
         char* p = buf.get_write();
         char* pe = p + buf.size();
         char* eof = buf.empty() ? pe : nullptr;
         char* parsed = static_cast<ConcreteParser*>(this)->parse(p, pe, eof);
         if (parsed) {
             buf.trim_front(parsed - p);
-            return make_ready_future<unconsumed_remainder>(std::move(buf));
+            return make_ready_future<consumption_result<char>>(stop_consuming<char>{std::move(buf)});
         }
-        return make_ready_future<unconsumed_remainder>();
+        return make_ready_future<consumption_result<char>>(continue_consuming{});
     }
 };
 
@@ -152,6 +148,5 @@ inline void trim_trailing_spaces_and_tabs(sstring& str) {
     }
     str.resize(i);
 }
-SEASTAR_MODULE_EXPORT_END
 
 }

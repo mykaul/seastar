@@ -19,27 +19,17 @@
  * Copyright 2017 Marek Waszkiewicz ( marek.waszkiewicz77@gmail.com )
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#include <boost/algorithm/cxx11/all_of.hpp>
-#include <boost/algorithm/cxx11/none_of.hpp>
-#include <boost/next_prior.hpp>
 #include <yaml-cpp/yaml.h>
-#include <algorithm>
 #include <istream>
+#include <optional>
+#include <ranges>
 #include <unordered_map>
 #include <string>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/net/config.hh>
-#include <seastar/core/print.hh>
-#endif
+#include <seastar/core/format.hh>
 
-using namespace boost::algorithm;
 
 namespace seastar {
 namespace net {
@@ -74,21 +64,21 @@ namespace net {
             }
         }
 
-        // check if all of ip,gw,nm are specified when dhcp is off
-        if (all_of(device_configs, [](std::pair<std::string, device_config> p) {
-                return !(!p.second.ip_cfg.dhcp
-                    && (!p.second.ip_cfg.ip.empty() && !p.second.ip_cfg.gateway.empty()
-                           && !p.second.ip_cfg.netmask.empty()));
+        // check each device: when dhcp is off, all of ip, gw, nm must be specified
+        if (std::ranges::any_of(device_configs, [](std::pair<std::string, device_config> p) {
+                return !p.second.ip_cfg.dhcp
+                    && (p.second.ip_cfg.ip.empty() || p.second.ip_cfg.gateway.empty()
+                           || p.second.ip_cfg.netmask.empty());
             })) {
             throw config_exception(
                 "when dhcp is off then all of ip, gateway, netmask has to be specified");
         }
 
-        // check if dhcp is not used when ip/gw/nm are specified
-        if (all_of(device_configs, [](std::pair<std::string, device_config> p) {
+        // check each device: dhcp cannot be used together with static ip/gw/nm
+        if (std::ranges::any_of(device_configs, [](std::pair<std::string, device_config> p) {
                 return p.second.ip_cfg.dhcp
-                    && !(p.second.ip_cfg.ip.empty() || p.second.ip_cfg.gateway.empty()
-                           || p.second.ip_cfg.netmask.empty());
+                    && (!p.second.ip_cfg.ip.empty() || !p.second.ip_cfg.gateway.empty()
+                           || !p.second.ip_cfg.netmask.empty());
             })) {
             throw config_exception("dhcp and ip cannot be used together");
         }
@@ -106,7 +96,7 @@ struct convert<seastar::net::device_config> {
         // test for unsupported key
 
         for (auto&& item : node) {
-            if (none_of(seastar::net::config_keys, [&item](std::string s) {
+            if (std::ranges::none_of(seastar::net::config_keys, [&item](std::string s) {
                     return s == item.first.as<std::string>();
                 })) {
                 throw seastar::net::config_exception(

@@ -4,20 +4,20 @@
 
 ### Sink and Source
 
-Basic element of streaming API is `rpc::sink` and `rpc::source`. The former
-is used to send data and the later is to receive it. Client and server
-has their own pair of sink and source. `rpc::sink` and `rpc::source` are
+The basic elements of the streaming API are `rpc::sink` and `rpc::source`. The former
+is used to send data and the latter to receive it. The client and server
+each have their own pair of sinks and sources. `rpc::sink` and `rpc::source` are
 templated classes where template parameters describe a type of the data
 that is sent/received. For instance the sink that is used to send messages
 containing `int` and `long` will be of a type `rpc::sink<int, long>`.  The
 opposite end of the stream will have a source of the type `rpc::source<int, long>`
 which will be used to receive those messages. Messages are received at a
-source as `std::optional` containing an actual message as an `std::tuple`. Unengaged
-optional means EOS (end of stream) - the stream was closed by a peer. If
-error happen before EOS is received a receiver cannot be sure it received all
+source as a `std::optional` containing the actual message as a `std::tuple`. A disengaged
+optional means EOS (end of stream): the stream was closed by the peer. If an
+error happens before EOS is received, the receiver cannot be sure that it received all
 the data.
 
-To send the data using `rpc::source<int, long>` one can write (assuming `seastar::async` context):
+To send data using `rpc::sink<int, long>`, one can write the following (assuming a `seastar::async` context):
 
 ```cpp
       while (has_data()) {
@@ -32,7 +32,7 @@ To receive:
 
 ```cpp
       while (true) {
-          std:optional<std::tuple<int, long>> data = source().get0();
+          std::optional<std::tuple<int, long>> data = source().get();
           if (!data) {
              // unengaged optional means EOS
              break;
@@ -45,13 +45,14 @@ To receive:
 
 ### Creating a stream
 
-To open an RPC stream one needs RPC client to be created already. The stream
-will be associated with the client and will be aborted if the client is closed
-before streaming is. Given RPC client `rc`, and a `serializer` class that models the Serializer concept (as explained in the rpc::protocol class), one creates `rpc::sink` as follows
+To open an RPC stream, an RPC client must already exist. The stream
+will be associated with the client, and closing the client aborts any stream
+still open on it. Aborting a stream this way is not a substitute for closing
+it, see [Closing a stream](#closing-a-stream) below. Given RPC client `rc`, and a `serializer` class that models the Serializer concept (as explained in the rpc::protocol class), one creates `rpc::sink` as follows
 (again assuming `seastar::async` context):
 
 ```cpp
-    rpc::sink<int, long> sink = rc.make_stream_sink<serializer, int, long>().get0();
+    rpc::sink<int, long> sink = rc.make_stream_sink<serializer, int, long>().get();
 ```
 
 Now the client has the sink that can be used for streaming data to
@@ -67,19 +68,19 @@ To receive the sink above one may register an RPC handler like that:
 ```
 
 Notice that `rpc::sink` is received as an `rpc::source` since at the server
-side it will be used for receive. Now all is left to do is for the client to
-invoke this RPC handler with aux_data and the sink.
+side it will be used to receive data. All that remains is for the client to
+invoke this RPC handler with `aux_data` and the sink.
 
-But what about communicating in another direction: from a server to a
-client. For that a server also has to have a sink and a client has to have
-a source and since messages in this direction may be of a different type
-than from client to server the sink and the source may be of a different
+For communication in the other direction, from server to client, the server
+must have a sink and the client must have a source. Because messages in this
+direction may have a different type from client-to-server messages, the sink
+and source may have a different
 type as well.
 
-Server initiates creation of a communication channel in another direction.
+The server initiates creation of a communication channel in the other direction.
 It does this by creating a sink from the source it receives and returning the sink
-from RPC handler which will cause it to be received as a source by a client. Lets look
-at the full example where server want to send message containing sstring to a client.
+from the RPC handler, causing it to be received as a source by the client. The following
+full example shows a server sending a message containing an `sstring` to a client.
 
 Server handler will look like that:
 
@@ -94,24 +95,40 @@ Server handler will look like that:
 Client code will be:
 
 ```cpp
-   auto rpc_call = rpc_proto.make_client<rpc::source<sstring> (int, rpc::sink<int>)>(1);
-   rpc::sink<int, long> sink = rc.make_stream_sink<serializer, int, long>().get0();
-   rpc::source<sstring> source = rpc_call(rc, aux_data, sink).get0();
+   auto rpc_call = rpc_proto.make_client<rpc::source<sstring> (int, rpc::sink<int, long>)>(1);
+   rpc::sink<int, long> sink = rc.make_stream_sink<serializer, int, long>().get();
+   rpc::source<sstring> source = rpc_call(rc, aux_data, sink).get();
    // use sink and source here
 ```
+
+### Closing a stream
+
+Both halves of a stream must be closed by the application:
+
+* **Close the sink** with `rpc::sink::close()` and wait for the returned
+  future. Dropping an unclosed sink is an error.
+* **Read the source until eof or error.** `rpc::source` deliberately has no
+  `close()`: reading it until it yields an unengaged optional (eof) or throws
+  is what closes it. If you no longer want the data, tell the peer at the
+  application level and then drain what is still in flight.
+
+The stream's connection is shut down only once both halves are closed.
+
+This applies on error too. The calls may fail, and the failures are expected,
+but they still have to be made.
 
 ## Implementation notes
 
 ### RPC stream creation
 
-RPC stream is implemented as a separate TCP connection. RPC server knows that a connection
+An RPC stream is implemented as a separate TCP connection. The RPC server knows that a connection
 will be used for streaming if during RPC negotiation `Stream parent` feature is present.
 The feature will contain ID of an RPC client that was used to create the stream.
 
 So in the example from previous chapter:
 
 ```cpp
-    rpc::sink<int, long> sink = rc.make_stream_sink<serializer, int, long>().get0();
+    rpc::sink<int, long> sink = rc.make_stream_sink<serializer, int, long>().get();
 ```
 
 the call will initiate a new TCP connection to the same server `rc` is connected to. During RPC
@@ -119,6 +136,6 @@ protocol negotiation this connection will have `Stream parent` feature with `rc`
 
 ### Passing sink/source over RPC call
 
-When `rpc::sink` is sent over RPC call it is serialized as its connection ID. Server's RPC handler
-then lookups the connection and creates an `rpc::source` from it. When RPC handler returns `rpc::sink`
-the same happens in other direction.    
+When `rpc::sink` is sent over an RPC call, it is serialized as its connection ID. The server's RPC handler
+then looks up the connection and creates an `rpc::source` from it. When an RPC handler returns `rpc::sink`,
+the same happens in the other direction.

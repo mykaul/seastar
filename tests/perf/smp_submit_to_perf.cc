@@ -20,7 +20,7 @@
  */
 
 #include <random>
-#include <boost/range/irange.hpp>
+#include <ranges>
 #include <fmt/core.h>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/thread.hh>
@@ -55,7 +55,7 @@ class thinker {
     future<> _done;
 
     future<> start_thinking(unsigned concurrency) {
-        return parallel_for_each(boost::irange(0u, concurrency), [this] (unsigned f) {
+        return parallel_for_each(std::views::iota(0u, concurrency), [this] (unsigned f) {
             return do_until([this] { return _stop; }, [this] {
                 auto until = steady_clock::now() + _pause.get();
                 while (steady_clock::now() < until) {
@@ -110,13 +110,13 @@ class worker {
     future<> _done;
 
     static unsigned my_target(unsigned targets) noexcept {
-        unsigned group_size = (smp::count + (targets - 1)) / targets;
+        unsigned group_size = (this_smp_shard_count() + (targets - 1)) / targets;
         unsigned group_no = this_shard_id() / group_size;
         return group_size * group_no;
     }
 
     future<> start_working(unsigned concurrency, respond_type resp, microseconds tmo) {
-        return parallel_for_each(boost::irange(0u, concurrency), [this, resp, tmo] (unsigned f) {
+        return parallel_for_each(std::views::iota(0u, concurrency), [this, resp, tmo] (unsigned f) {
             return do_until([this] { return _stop; }, [this, resp, tmo] {
                 return smp::submit_to(_to, [resp, tmo] {
                     switch (resp) {
@@ -231,7 +231,7 @@ int main(int ac, char** av) {
             auto real_duration = duration_cast<seconds>(steady_clock::now() - start);
             fmt::print("took {}s (expected {}s)\n", real_duration.count(), duration.count());
             stats st(real_duration.count()), st_targets(real_duration.count());
-            for (unsigned i = 0; i < smp::count; i++) {
+            for (unsigned i = 0; i < this_smp_shard_count(); i++) {
                 workers.invoke_on(i, [&st, &st_targets] (worker& w) {
                     if (w.is_target()) {
                         st_targets.append(w.total());

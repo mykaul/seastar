@@ -44,13 +44,13 @@ See the instructions in [README.md](./README.md).
 
 ## Using an IDE with CMake support
 
-If you use `configure.py` or `cooking.sh` to to configure Seastar, then the easiest way to use an IDE (such as Qt Creator, or CLion) for development is to instruct the IDE, when it invokes CMake, to include the following option:
+If you use `configure.py` or `cooking.sh` to configure Seastar, then the easiest way to use an IDE (such as Qt Creator or CLion) for development is to instruct the IDE, when it invokes CMake, to include the following option:
 
 ```
 -DCMAKE_PREFIX_PATH=${source_dir}/build/_cooking/installed
 ```
 
-where `${source_dir}` is the root of the Seastar source tree on your file-system.
+where `${source_dir}` is the root of the Seastar source tree on your filesystem.
 
 This will allow the IDE to also index Seastar's dependencies.
 
@@ -73,12 +73,6 @@ Make sure you are in the "build" directory.
 
 ```
 ninja test_unit
-```
-
-- Run distribution tests (these take a long time the first time, but then the dependencies are cached):
-
-```
-ninja test_dist
 ```
 
 - Run all tests:
@@ -153,7 +147,7 @@ find_package (Seastar ${VERSION} REQUIRED)
 
 add_executable (my_program
   my_program.cc)
-  
+
 target_link_libraries (my_program
   PRIVATE Seastar::seastar)
 ```
@@ -195,3 +189,51 @@ g++ -o foo_bar foo.o bar.o $(pkg-config --libs --static /path/to/seastar.pc)
 ```
 
 The `--static` flag is needed to include transitive (private) dependencies of `libseastar.a`.
+
+## Development Tools
+
+### IO Tracing
+
+Seastar includes LTTng-UST tracepoints in the IO scheduler for
+low-overhead recording of IO request lifecycle events.  Install
+`liblttng-ust-dev` (Debian/Ubuntu) or `lttng-ust-devel` (Fedora/RHEL)
+before building to enable them.  See [doc/io-tracing.md](doc/io-tracing.md)
+for usage instructions.
+
+### Pre-commit hooks
+
+This project uses [pre-commit](https://pre-commit.com/) to enforce some basic checks. These
+checks run in CI, but you can also run them locally as a pre-commit hook as follows.
+
+#### Installation
+
+[Install pre-commit](https://pre-commit.com/#install), following those instructions or
+perhaps using `uv` to avoid polluting your global environment:
+
+```
+uv tool install pre-commit
+```
+
+#### Setup
+
+Install the git hooks:
+
+```
+pre-commit install
+```
+
+This will run the configured hooks automatically on every commit.
+
+#### Manual execution
+
+Run hooks on all files:
+
+```
+pre-commit run --all-files
+```
+
+Run hooks on staged files only:
+
+```
+pre-commit run
+```

@@ -28,16 +28,16 @@
 #include <seastar/core/posix.hh>
 #include <seastar/core/reactor_config.hh>
 #include <seastar/core/resource.hh>
-#include <seastar/util/modules.hh>
+#include <seastar/core/shard_id.hh>
+#include <seastar/core/cacheline.hh>
 
-#ifndef SEASTAR_MODULE
 #include <boost/lockfree/spsc_queue.hpp>
-#include <boost/thread/barrier.hpp>
-#include <boost/range/irange.hpp>
 #include <deque>
 #include <optional>
 #include <thread>
-#endif
+#include <ranges>
+#include <span>
+#include <barrier>
 
 /// \file
 
@@ -45,8 +45,6 @@ namespace seastar {
 
 class reactor_backend_selector;
 
-SEASTAR_MODULE_EXPORT_BEGIN
-using shard_id = unsigned;
 
 class smp_service_group;
 
@@ -55,20 +53,10 @@ namespace alien {
 class instance;
 
 }
-SEASTAR_MODULE_EXPORT_END
 
 namespace internal {
 
 unsigned smp_service_group_id(smp_service_group ssg) noexcept;
-
-#ifdef SEASTAR_BUILD_SHARED_LIBS
-shard_id* this_shard_id_ptr() noexcept;
-#else
-inline shard_id* this_shard_id_ptr() noexcept {
-    static thread_local shard_id g_this_shard_id;
-    return &g_this_shard_id;
-}
-#endif
 
 class memory_prefaulter;
 
@@ -80,12 +68,6 @@ struct numa_layout;
 
 }
 
-SEASTAR_MODULE_EXPORT_BEGIN
-
-/// Returns shard_id of the of the current shard.
-inline shard_id this_shard_id() noexcept {
-    return *internal::this_shard_id_ptr();
-}
 
 /// Configuration for smp_service_group objects.
 ///
@@ -108,7 +90,7 @@ struct smp_service_group_config {
 /// smp::submit_to() and similar calls. While it's easy to limit
 /// the caller's concurrency (for example, by using a semaphore),
 /// the concurrency at the remote end can be multiplied by a factor
-/// of smp::count-1, which can be large.
+/// of smp::shard_count()-1, which can be large.
 ///
 /// The class is called a service _group_ because it can be used
 /// to group similar calls that share resource usage characteristics,
@@ -136,7 +118,6 @@ private:
     friend future<> destroy_smp_service_group(smp_service_group) noexcept;
 };
 
-SEASTAR_MODULE_EXPORT_END
 
 inline
 unsigned
@@ -144,7 +125,6 @@ internal::smp_service_group_id(smp_service_group ssg) noexcept {
     return ssg._id;
 }
 
-SEASTAR_MODULE_EXPORT_BEGIN
 /// Returns the default smp_service_group. This smp_service_group
 /// does not impose any limits on concurrency in the target shard.
 /// This makes is deadlock-safe, but can consume unbounded resources,
@@ -173,11 +153,9 @@ using smp_timeout_clock = lowres_clock;
 using smp_service_group_semaphore = basic_semaphore<named_semaphore_exception_factory, smp_timeout_clock>;
 using smp_service_group_semaphore_units = semaphore_units<named_semaphore_exception_factory, smp_timeout_clock>;
 
-SEASTAR_MODULE_EXPORT_END
 
 static constexpr smp_timeout_clock::time_point smp_no_timeout = smp_timeout_clock::time_point::max();
 
-SEASTAR_MODULE_EXPORT_BEGIN
 /// Options controlling the behaviour of \ref smp::submit_to().
 struct smp_submit_to_options {
     /// Controls resource allocation.
@@ -325,19 +303,33 @@ class smp_message_queue;
 struct reactor_options;
 struct smp_options;
 
+/// A set of cooperating reactor threads.
+///
+/// An smp instance manages a set of reactor threads, sharing memory and
+/// communicating via messages. The number of threads is determined
+/// at construction time and does not change over the lifetime of the smp
+/// instance.
+///
+/// Multiple smp instances may exist in the same process, typically for
+/// testing purposes.
 class smp : public std::enable_shared_from_this<smp> {
     alien::instance& _alien;
+    unsigned _shard_count = 0;
     std::vector<posix_thread> _threads;
     std::vector<std::function<void ()>> _thread_loops; // for dpdk
-    std::optional<boost::barrier> _all_event_loops_done;
+    std::optional<std::barrier<>> _all_event_loops_done;
     std::unique_ptr<internal::memory_prefaulter> _prefaulter;
     struct qs_deleter {
+      unsigned shard_count;
       void operator()(smp_message_queue** qs) const;
     };
     std::unique_ptr<smp_message_queue*[], qs_deleter> _qs_owner;
     static thread_local smp_message_queue**_qs;
     static thread_local std::thread::id _tmain;
+    static inline thread_local smp* _this_smp = nullptr;
+    static inline thread_local int _pinned_cpu_id = -1;
     bool _using_dpdk = false;
+    std::vector<unsigned> _shard_to_numa_node_mapping;
 
 private:
     void setup_prefaulter(const seastar::resource::resources& res, seastar::memory::internal::numa_layout layout);
@@ -345,11 +337,18 @@ public:
     explicit smp(alien::instance& alien);
     ~smp();
     void configure(const smp_options& smp_opts, const reactor_options& reactor_opts);
+
+    /// The number of shards available in this `smp` instance. Does not change over the lifetime of the instance.
+    unsigned shard_count() const { return _shard_count; }
+
     void cleanup() noexcept;
     void cleanup_cpu();
     void arrive_at_event_loop_end();
     void join_all();
     static bool main_thread() { return std::this_thread::get_id() == _tmain; }
+
+    /// \returns A integer span of size smp::shard_count(), with nth integer being the ID of nth shard's NUMA node.
+    std::span<const unsigned> shard_to_numa_node_mapping() const noexcept;
 
     /// Runs a function on a remote core.
     ///
@@ -409,9 +408,40 @@ public:
     }
     static bool poll_queues();
     static bool pure_poll_queues();
-    static boost::integer_range<unsigned> all_cpus() noexcept {
-        return boost::irange(0u, count);
+
+    /// Returns a range of all shard IDs.
+    ///
+    /// Returns a range of all shard IDs (a range with a value_type
+    /// of some unspecified unsigned type) in this `smp` instance.
+    /// Order is unspecified. Does not change over the lifetime of the instance.
+    std::ranges::range auto all_shards() const noexcept {
+        return std::views::iota(0u, _shard_count);
     }
+
+    [[deprecated("use smp::all_shards instead")]]
+    static std::ranges::range auto all_cpus() noexcept {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        return std::views::iota(0u, count);
+#pragma GCC diagnostic pop
+    }
+private:
+    template <typename Func>
+    requires std::is_nothrow_copy_constructible_v<Func>
+    static futurize_t<std::invoke_result_t<Func>> copy_and_submit_to(unsigned t, smp_submit_to_options options, const Func& func) noexcept {
+        return submit_to(t, options, Func(func));
+    }
+
+    template <typename Func>
+    requires (!std::is_nothrow_copy_constructible_v<Func>)
+    static futurize_t<std::invoke_result_t<Func>> copy_and_submit_to(unsigned t, smp_submit_to_options options, const Func& func) noexcept {
+        try {
+            return submit_to(t, options, Func(func));
+        } catch (...) {
+            return current_exception_as_future();
+        }
+    }
+public:
     /// Invokes func on all shards.
     ///
     /// \param options the options to forward to the \ref smp::submit_to()
@@ -421,12 +451,12 @@ public:
     ///         of \c func.
     /// \returns a future that resolves when all async invocations finish.
     template<typename Func>
-    SEASTAR_CONCEPT( requires std::is_nothrow_move_constructible_v<Func> )
+     requires std::is_nothrow_move_constructible_v<Func>
     static future<> invoke_on_all(smp_submit_to_options options, Func&& func) noexcept {
         static_assert(std::is_same_v<future<>, typename futurize<std::invoke_result_t<Func>>::type>, "bad Func signature");
         static_assert(std::is_nothrow_move_constructible_v<Func>);
-        return parallel_for_each(all_cpus(), [options, &func] (unsigned id) {
-            return smp::submit_to(id, options, Func(func));
+        return parallel_for_each(this_smp().all_shards(), [options, &func] (unsigned id) {
+            return smp::copy_and_submit_to(id, options, func);
         });
     }
     /// Invokes func on all shards.
@@ -452,13 +482,12 @@ public:
     ///         of \c func.
     /// \returns a future that resolves when all async invocations finish.
     template<typename Func>
-    SEASTAR_CONCEPT( requires std::is_nothrow_move_constructible_v<Func> &&
-            std::is_nothrow_copy_constructible_v<Func> )
+    requires std::is_nothrow_move_constructible_v<Func>
     static future<> invoke_on_others(unsigned cpu_id, smp_submit_to_options options, Func func) noexcept {
         static_assert(std::is_same_v<future<>, typename futurize<std::invoke_result_t<Func>>::type>, "bad Func signature");
         static_assert(std::is_nothrow_move_constructible_v<Func>);
-        return parallel_for_each(all_cpus(), [cpu_id, options, func = std::move(func)] (unsigned id) {
-            return id != cpu_id ? smp::submit_to(id, options, Func(func)) : make_ready_future<>();
+        return parallel_for_each(this_smp().all_shards(), [cpu_id, options, func = std::move(func)] (unsigned id) {
+            return id != cpu_id ? smp::copy_and_submit_to(id, options, func) : make_ready_future<>();
         });
     }
     /// Invokes func on all other shards.
@@ -472,7 +501,7 @@ public:
     /// Passes the default \ref smp_submit_to_options to the
     /// \ref smp::submit_to() called behind the scenes.
     template<typename Func>
-    SEASTAR_CONCEPT( requires std::is_nothrow_move_constructible_v<Func> )
+    requires std::is_nothrow_move_constructible_v<Func>
     static future<> invoke_on_others(unsigned cpu_id, Func func) noexcept {
         return invoke_on_others(cpu_id, smp_submit_to_options{}, std::move(func));
     }
@@ -483,20 +512,55 @@ public:
     ///         of \c func.
     /// \returns a future that resolves when all async invocations finish.
     template<typename Func>
-    SEASTAR_CONCEPT( requires std::is_nothrow_move_constructible_v<Func> )
+    requires std::is_nothrow_move_constructible_v<Func>
     static future<> invoke_on_others(Func func) noexcept {
         return invoke_on_others(this_shard_id(), std::move(func));
+    }
+    static smp& this_smp() noexcept {
+        return *_this_smp;
+    }
+    /// The host cpu this shard's thread is pinned to, or -1 if it is not
+    /// pinned - with --overprovisioned (thread-affinity disabled), or under
+    /// dpdk, which pins by itself.
+    static int pinned_cpu_id() noexcept {
+        return _pinned_cpu_id;
     }
 private:
     void start_all_queues();
     void pin(unsigned cpu_id);
     void allocate_reactor(unsigned id, reactor_backend_selector rbs, reactor_config cfg);
     void create_thread(std::function<void ()> thread_loop);
-    unsigned adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs);
+    unsigned adjust_max_networking_aio_io_control_blocks(unsigned network_iocbs, unsigned reserve_iocbs);
+    void log_aiocbs(log_level level, unsigned storage, unsigned preempt, unsigned network, unsigned reserve);
 public:
+    [[deprecated("use smp::shard_count() instead")]]
     static unsigned count;
 };
 
-SEASTAR_MODULE_EXPORT_END
+
+/// Returns the smp object used for cross-shard communications.
+/// May only be called from a reactor thread.
+inline
+smp&
+this_smp() noexcept {
+    return smp::this_smp();
+}
+
+/// Returns the number of shards in the current smp instance.
+/// May only be called from a reactor thread.
+inline
+unsigned
+this_smp_shard_count() noexcept {
+    return this_smp().shard_count();
+}
+
+/// Returns a range of all shard ids in the current smp instance.
+/// May only be called from a reactor thread.
+inline
+std::ranges::range auto
+this_smp_all_shards() noexcept {
+    return this_smp().all_shards();
+}
+
 
 }

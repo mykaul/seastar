@@ -27,173 +27,198 @@ else
     exit 1
 fi
 
-debian_packages=(
-    ninja-build
-    ragel
-    libhwloc-dev
-    libnuma-dev
-    libpciaccess-dev
-    libcrypto++-dev
-    libboost-all-dev
-    libxml2-dev
-    xfslibs-dev
-    libgnutls28-dev
-    liblz4-dev
-    libsctp-dev
-    liburing-dev
-    gcc
-    make
-    meson
-    python3
-    python3-pyelftools
-    systemtap-sdt-dev
-    libtool
-    cmake
-    libyaml-cpp-dev
-    libc-ares-dev
-    stow
-    g++
-    libfmt-dev
-    diffutils
-    valgrind
-    doxygen
-    openssl
-    pkg-config
-    libprotobuf-dev
-    protobuf-compiler
-)
-
 # seastar doesn't directly depend on these packages. They are
 # needed because we want to link seastar statically and pkg-config
 # has no way of saying "static seastar, but dynamic transitive
 # dependencies". They provide the various .so -> .so.ver symbolic
 # links.
-transitive=(libtool-ltdl-devel trousers-devel libidn2-devel libunistring-devel)
+#
+# The two lists differ because each distribution's gnutls and hwloc
+# name their own private requirements.
+debian_transitive=(
+    libudev-dev
+    libunistring-dev
+    libzstd-dev
+)
 
-redhat_packages=(
-    hwloc-devel
-    numactl-devel
-    libpciaccess-devel
-    cryptopp-devel
-    libxml2-devel
-    xfsprogs-devel
-    gnutls-devel
-    lksctp-tools-devel
-    lz4-devel
-    liburing-devel
-    gcc
-    make
-    meson
-    python3
-    python3-pyelftools
-    systemtap-sdt-devel
-    libtool
+redhat_transitive=(
+    libidn2-devel
+    libtool-ltdl-devel
+    libunistring-devel
+    trousers-devel
+)
+
+debian_packages=(
     cmake
-    yaml-cpp-devel
-    c-ares-devel
-    stow
     diffutils
     doxygen
+    g++
+    gcc
+    libboost-all-dev
+    libc-ares-dev
+    libcrypto++-dev
+    libfmt-dev
+    libgnutls28-dev
+    libhwloc-dev
+    liblz4-dev
+    libnuma-dev
+    libpciaccess-dev
+    libprotobuf-dev
+    libsctp-dev
+    libssl-dev
+    libtool
+    liburing-dev
+    libxml2-dev
+    libyaml-cpp-dev
+    make
+    meson
+    ninja-build
     openssl
-    fmt-devel
-    boost-devel
-    valgrind-devel
-    protobuf-devel
+    pkg-config
     protobuf-compiler
-    "${transitive[@]}"
+    python3
+    python3-pyelftools
+    python3-yaml
+    ragel
+    stow
+    liblttng-ust-dev
+    lttng-tools
+    babeltrace2
+    xfslibs-dev
+    "${debian_transitive[@]}"
+)
+
+redhat_packages=(
+    boost-devel
+    c-ares-devel
+    cmake
+    diffutils
+    doxygen
+    fmt-devel
+    gcc
+    gnutls-devel
+    hwloc-devel
+    libpciaccess-devel
+    libtool
+    liburing-devel
+    libxml2-devel
+    lksctp-tools-devel
+    lz4-devel
+    make
+    meson
+    numactl-devel
+    openssl
+    openssl-devel
+    protobuf-compiler
+    protobuf-devel
+    python3
+    python3-pyelftools
+    python3-pyyaml
+    stow
+    lttng-ust-devel
+    lttng-tools
+    babeltrace2
+    xfsprogs-devel
+    yaml-cpp-devel
+    "${redhat_transitive[@]}"
 )
 
 fedora_packages=(
     "${redhat_packages[@]}"
-    gcc-c++
-    ninja-build
-    ragel
     boost-devel
     fmt-devel
-    libubsan
+    gcc-c++
     libasan
     libatomic
-    valgrind-devel
+    libubsan
+    ninja-build
+    ragel
 )
 
 centos7_packages=(
     "${redhat_packages[@]}"
-    ninja-build
-    ragel
     cmake3
-    rh-mongodb36-boost-devel
     devtoolset-11-gcc-c++
-    devtoolset-11-libubsan
     devtoolset-11-libasan
     devtoolset-11-libatomic
+    devtoolset-11-libubsan
+    ninja-build
+    ragel
+    rh-mongodb36-boost-devel
 )
 
 centos8_packages=(
     "${redhat_packages[@]}"
-    ninja-build
-    ragel
     gcc-toolset-11-gcc
     gcc-toolset-11-gcc-c++
-    gcc-toolset-11-libubsan-devel
     gcc-toolset-11-libasan-devel
     gcc-toolset-11-libatomic-devel
+    gcc-toolset-11-libubsan-devel
+    ninja-build
+    ragel
 )
 
 centos9_packages=(
     "${redhat_packages[@]}"
-    ninja-build
-    ragel
     gcc-toolset-13-gcc
     gcc-toolset-13-gcc-c++
-    gcc-toolset-13-libubsan-devel
     gcc-toolset-13-libasan-devel
     gcc-toolset-13-libatomic-devel
+    gcc-toolset-13-libubsan-devel
+    ninja-build
+    ragel
 )
 
-# 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
-#    some old containers may contain glibc older,
-#    so enforce update on that one.
-# 2) if problems with signatures, ensure having fresh
-#    archlinux-keyring: pacman -Sy archlinux-keyring && pacman -Syyu
-# 3) aur installations require having sudo and being
-#    a sudoer. makepkg does not work otherwise.
+# if problems with signatures, ensure having fresh
+# archlinux-keyring: pacman -Sy archlinux-keyring && pacman -Syyu
+# aur installations require having sudo and being
+# a sudoer. makepkg does not work otherwise.
 arch_packages=(
-    gcc
-    ninja
-    ragel
     boost
     boost-libs
-    hwloc
-    numactl
-    libpciaccess
+    c-ares
+    cmake
     crypto++
-    libxml2
-    xfsprogs
+    doxygen
+    filesystem
+    fmt
+    gcc
+    glibc
     gnutls
+    hwloc
+    libpciaccess
+    libtool
+    liburing
+    libxml2
     lksctp-tools
+    lttng-ust
     lz4
     make
     meson
-    python-pyelftools
-    libtool
-    cmake
-    yaml-cpp
-    stow
-    c-ares
-    pkgconf
-    fmt
-    python3
-    glibc
-    filesystem
-    valgrind
+    ninja
+    numactl
     openssl
-    liburing
+    pkgconf
+    protobuf
+    python-pyelftools
+    python-yaml
+    python3
+    ragel
+    stow
+    xfsprogs
+    yaml-cpp
 )
 
 opensuse_packages=(
     c-ares-devel
     cmake
     hwloc-devel
+    libboost_atomic1_66_0
+    libboost_atomic1_66_0-devel
+    libboost_chrono1_66_0
+    libboost_chrono1_66_0-devel
+    libboost_date_time1_66_0
+    libboost_date_time1_66_0-devel
     libboost_filesystem1_66_0
     libboost_filesystem1_66_0-devel
     libboost_program_options1_66_0
@@ -204,30 +229,32 @@ opensuse_packages=(
     libboost_test1_66_0-devel
     libboost_thread1_66_0
     libboost_thread1_66_0-devel
-    libcryptopp-devel
-    libboost_atomic1_66_0
-    libboost_atomic1_66_0-devel
-    libboost_date_time1_66_0
-    libboost_date_time1_66_0-devel
-    libboost_chrono1_66_0
-    libboost_chrono1_66_0-devel
     libgnutls-devel
     libgnutlsxx28
     liblz4-devel
     libnuma-devel
+    libtool
     lksctp-tools-devel
     meson
     ninja
+    openssl
+    protobuf-devel
+    python3-PyYAML
     ragel
+    stow
     xfsprogs-devel
     yaml-cpp-devel
-    libtool
-    stow
-    openssl
 )
 
 case "$ID" in
-    ubuntu|debian|pop)
+    ubuntu|debian|pop|sparky)
+        # Another transitive dependency of gnutls, but one it links
+        # statically, and only on the releases whose gnutls uses it at
+        # all -- so ask for it only where it exists rather than fail
+        # the whole install on the ones where it does not.
+        if apt-cache show libjitterentropy3-dev > /dev/null 2>&1; then
+            debian_packages+=(libjitterentropy3-dev)
+        fi
         apt-get install -y "${debian_packages[@]}"
     ;;
     fedora)
