@@ -21,6 +21,10 @@ import urllib.request
 import yaml
 import platform
 import shlex
+import psutil
+import mmap
+import datetime
+import dataclasses
 
 dry_run_mode = False
 def perftune_print(log_msg, *args, **kwargs):
@@ -171,21 +175,22 @@ def restart_irqbalance(banned_irqs):
     perftune_print("Restarting irqbalance: going to ban the following IRQ numbers: {} ...".format(", ".join(banned_irqs_list)))
 
     # Search for the original options line
-    opt_lines = list(filter(lambda line : re.search("^\s*{}".format(options_key), line), cfile_lines))
+    opt_lines = list(filter(lambda line : re.search(r"^\s*{}".format(options_key), line), cfile_lines))
     if not opt_lines:
         new_options = "{}=\"".format(options_key)
     elif len(opt_lines) == 1:
         # cut the last "
-        new_options = re.sub("\"\s*$", "", opt_lines[0].rstrip())
+        new_options = re.sub(r'"\s*$', "", opt_lines[0].rstrip())
         opt_lines = opt_lines[0].strip()
     else:
         raise Exception("Invalid format in {}: more than one lines with {} key".format(config_file, options_key))
 
     for irq in banned_irqs_list:
         # prevent duplicate "ban" entries for the same IRQ
-        patt_str = "\-\-banirq\={}\Z|\-\-banirq\={}\s".format(irq, irq)
+        opt = f"--banirq={irq}"
+        patt_str = rf"{opt}\Z|{opt}\s"
         if not re.search(patt_str, new_options):
-            new_options += " --banirq={}".format(irq)
+            new_options += f" {opt}"
 
     new_options += "\""
 
@@ -196,7 +201,7 @@ def restart_irqbalance(banned_irqs):
     else:
         with open(config_file, 'w') as cfile:
             for line in cfile_lines:
-                if not re.search("^\s*{}".format(options_key), line):
+                if not re.search(r"^\s*{}".format(options_key), line):
                     cfile.write(line)
 
             cfile.write(new_options + "\n")
@@ -330,6 +335,16 @@ def auto_detect_irq_mask(cpu_mask, cores_per_irq_core):
         return run_hwloc_calc(['--restrict', cpu_mask] + hwloc_args)
 
 
+def check_sysfs_numa_topology_is_valid():
+    # Verify that the sysfs entry exists correctly, same as the checks
+    # performed by hwloc code (check_sysfs_cpu_path() on topology-linux.c)
+    if os.path.isdir("/sys/devices/system/cpu"):
+        if os.path.exists("/sys/devices/system/cpu/cpu0/topology/package_cpus") or os.path.exists("/sys/devices/system/cpu/cpu0/topology/core_cpus"):
+            return True
+        if os.path.exists("/sys/devices/system/cpu/cpu0/topology/core_siblings") or os.path.exists("/sys/devices/system/cpu/cpu0/topology/thread_siblings"):
+            return True
+    return False
+
 ################################################################################
 class PerfTunerBase(metaclass=abc.ABCMeta):
     def __init__(self, args):
@@ -343,13 +358,21 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
         elif args.irq_cpu_mask:
             self.irqs_cpu_mask = args.irq_cpu_mask
         else:
+            if not check_sysfs_numa_topology_is_valid():
+                raise PerfTunerBase.InvalidNUMATopologyException("NUMA topology information is corrupted")
             self.irqs_cpu_mask = auto_detect_irq_mask(self.cpu_mask, self.cores_per_irq_core)
 
         self.__is_aws_i3_nonmetal_instance = None
+        self.__metadata_token_value = None
+        self.__metadata_token_time = None
 
 #### Public methods ##########################
     class CPUMaskIsZeroException(Exception):
         """Thrown if CPU mask turns out to be zero"""
+        pass
+
+    class InvalidNUMATopologyException(Exception):
+        """Thrown if NUMA Topology is invalid"""
         pass
 
     class SupportedModes(enum.IntEnum):
@@ -546,13 +569,49 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
         pass
 
 #### Private methods ############################
+    @property
+    def __ec2_metadata_base_url(self):
+        return "http://169.254.169.254/latest/"
+
+    @property
+    def __metadata_token(self):
+        """
+        Refresh IMDSv2 session token if it necessary, and return current token
+        :return: current session token
+        """
+        token_ttl = 21600
+        update_token = False
+        if not self.__metadata_token_value:
+            update_token = True
+        else:
+            time_diff = datetime.datetime.now() - self.__metadata_token_time
+            time_diff_sec = int(time_diff.total_seconds())
+            if time_diff_sec >= token_ttl - 120:
+                update_token = True
+        if update_token:
+            self.__metadata_token_time = datetime.datetime.now()
+            req = urllib.request.Request(self.__ec2_metadata_base_url + "api/token", headers={"X-aws-ec2-metadata-token-ttl-seconds": token_ttl}, method="PUT")
+            with urllib.request.urlopen(req, timeout=0.1) as res:
+                self.__metadata_token_value = res.read().decode()
+        return self.__metadata_token_value
+
+    def __get_instance_metadata(self, path):
+        """
+        Get a parameter from EC2 Metadata server
+        :param path: metadata path to access for
+        :return: received metadata as a string
+        """
+        req = urllib.request.Request(self.__ec2_metadata_base_url + 'meta-data/' + path, headers={"X-aws-ec2-metadata-token": self.__metadata_token})
+        with urllib.request.urlopen(req, timeout=0.1) as res:
+            return res.read().decode()
+
     def __check_host_type(self):
         """
         Check if we are running on the AWS i3 nonmetal instance.
         If yes, set self.__is_aws_i3_nonmetal_instance to True, and to False otherwise.
         """
         try:
-            aws_instance_type = urllib.request.urlopen("http://169.254.169.254/latest/meta-data/instance-type", timeout=0.1).read().decode()
+            aws_instance_type = self.__get_instance_metadata('instance-type')
             if re.match(r'^i3\.((?!metal)\w)+$', aws_instance_type):
                 self.__is_aws_i3_nonmetal_instance = True
             else:
@@ -567,6 +626,71 @@ class PerfTunerBase(metaclass=abc.ABCMeta):
 
         self.__is_aws_i3_nonmetal_instance = False
 
+
+def _ethtool_label(label):
+    """
+    Field factory that attaches an ethtool output label to a dataclass field.
+    """
+    return dataclasses.field(metadata={'label': label})
+
+
+@dataclasses.dataclass
+class LabeledDataclass:
+    """
+    Base for dataclasses whose fields carry ``metadata={'label': ...}``.
+    Provides a class-level mapping from lowercased labels to field names.
+    """
+
+    @classmethod
+    def _validate_labels(cls):
+        """
+        Verify that every field has a ``'label'`` metadata entry.
+        Raises ``TypeError`` if any field is missing one.
+        """
+        unlabeled = [f.name for f in dataclasses.fields(cls) if 'label' not in f.metadata]
+        if unlabeled:
+            raise TypeError(f"{cls.__name__}: fields {unlabeled} are missing 'label' metadata")
+
+    @classmethod
+    def label_to_field_name(cls):
+        """
+        Return a dict mapping ``label.lower()`` → field name.
+        """
+        cls._validate_labels()
+        return {f.metadata['label'].lower(): f.name for f in dataclasses.fields(cls)}
+
+    @classmethod
+    def labels(cls):
+        """
+        Return the list of label strings in field-definition order.
+        """
+        cls._validate_labels()
+        return [f.metadata['label'] for f in dataclasses.fields(cls)]
+
+
+@dataclasses.dataclass
+class EthtoolChannelPropertiesValues(LabeledDataclass):
+    """
+    RX / TX / Other / Combined channel counts from a single ``ethtool -l``
+    section.  ``None`` means the device reported ``n/a``.
+    """
+
+    rx: int | None = _ethtool_label('RX')
+    tx: int | None = _ethtool_label('TX')
+    other: int | None = _ethtool_label('Other')
+    combined: int | None = _ethtool_label('Combined')
+
+
+@dataclasses.dataclass
+class EthtoolLChannelInfo(LabeledDataclass):
+    """
+    Both sections of ``ethtool -l`` output.
+    """
+
+    preset_maximums: EthtoolChannelPropertiesValues = _ethtool_label('Pre-set maximums')
+    current_hardware_settings: EthtoolChannelPropertiesValues = _ethtool_label('Current hardware settings')
+
+
 #################################################
 class NetPerfTuner(PerfTunerBase):
     def __init__(self, args):
@@ -574,10 +698,11 @@ class NetPerfTuner(PerfTunerBase):
 
         self.nics=args.nics
 
-        self.__nic_is_bond_iface = self.__check_dev_is_bond_iface()
-        self.__slaves = self.__learn_slaves()
+        self.__nic_is_bond_iface_dict = NetPerfTuner.__get_bond_ifaces()
+        self.__nic_is_vlan_iface_dict = NetPerfTuner.__get_vlan_ifaces()
+        self.__slaves_dict = self.__learn_slaves()
 
-        # check that self.nics contain a HW device or a bonding interface
+        # check that self.nics contain a HW device or a supported composite interface
         self.__check_nics()
 
         # Fetch IRQs related info
@@ -585,17 +710,89 @@ class NetPerfTuner(PerfTunerBase):
 
 
 #### Public methods ############################
+    @staticmethod
+    def __get_ethtool_l_info(iface: str) -> EthtoolLChannelInfo:
+        """
+        Run ``ethtool -l <iface>`` and return its parsed output.
+
+        :param iface: network interface name
+        :return: :class:`EthtoolLChannelInfo`
+        :raises ValueError: on missing or malformed sections
+        """
+        lines = run_ethtool(['-l', iface])
+
+        # Example of the ``ethtool -l <iface>`` command output:
+        #
+        #         $ ethtool -l enP16753s1
+        #         Channel parameters for enP16753s1:
+        #         Pre-set maximums:
+        #         RX:		n/a
+        #         TX:		n/a
+        #         Other:		n/a
+        #         Combined:	16
+        #         Current hardware settings:
+        #         RX:		n/a
+        #         TX:		n/a
+        #         Other:		n/a
+        #         Combined:	2
+        #
+        # As we can see there are 2 sections: "Pre-set maximums" and "Current hardware settings".
+        # The structure of each of the two sections is exactly the same and values can be either "n/a" or an integer.
+
+        prop_label_to_field = EthtoolChannelPropertiesValues.label_to_field_name()
+        section_label_to_field = EthtoolLChannelInfo.label_to_field_name()
+
+        section_re = re.compile(rf'^({"|".join(re.escape(l) for l in EthtoolLChannelInfo.labels())})\s*:', re.I)
+        channel_re = re.compile(rf'^\s*({"|".join(EthtoolChannelPropertiesValues.labels())})\s*:\s*(.+?)\s*$', re.I)
+
+        def parse_value(raw):
+            return None if raw.strip().lower() == 'n/a' else int(raw)
+
+        def parse_block(start):
+            vals = {}
+            for line in lines[start:]:
+                if section_re.match(line):
+                    break
+                m = channel_re.match(line)
+                if m:
+                    vals[prop_label_to_field[m.group(1).lower()]] = parse_value(m.group(2))
+            missing = [l for l in EthtoolChannelPropertiesValues.labels() if prop_label_to_field[l.lower()] not in vals]
+            if missing:
+                raise ValueError(f"ethtool -l: missing channel keys {missing}")
+            return EthtoolChannelPropertiesValues(**vals)
+
+        section_starts = {}
+        for idx, line in enumerate(lines):
+            m = section_re.match(line)
+            if m:
+                section_starts[m.group(1).lower()] = idx + 1
+
+        missing_sections = [l for l in EthtoolLChannelInfo.labels() if l.lower() not in section_starts]
+        if missing_sections:
+            raise ValueError(f"ethtool -l: missing sections {missing_sections}")
+
+        return EthtoolLChannelInfo(**{
+            section_label_to_field[label]: parse_block(start)
+            for label, start in section_starts.items()
+        })
+
     def tune(self):
         """
         Tune the networking server configuration.
         """
         for nic in self.nics:
-            if self.nic_is_hw_iface(nic):
-                perftune_print("Setting a physical interface {}...".format(nic))
-                self.__setup_one_hw_iface(nic)
-            else:
-                perftune_print("Setting {} bonding interface...".format(nic))
-                self.__setup_bonding_iface(nic)
+            if self.__nic_is_tunable(nic):
+                perftune_print("Setting a tunable interface {}...".format(nic))
+                self.__setup_one_tunable_iface(nic)
+
+            if self.__nic_has_slaves(nic):
+                nic_type = "virtual"
+                if self.__nic_is_bond_iface(nic):
+                    nic_type = "bond"
+                elif self.__nic_is_vlan_iface(nic):
+                    nic_type = "VLAN"
+                perftune_print(f"Setting a {nic} {nic_type} interface...")
+                self.__setup_virtual_iface(nic)
 
         # Increase the socket listen() backlog
         fwriteln_and_log('/proc/sys/net/core/somaxconn', '4096')
@@ -604,22 +801,7 @@ class NetPerfTuner(PerfTunerBase):
         # did not receive an acknowledgment from connecting client.
         fwriteln_and_log('/proc/sys/net/ipv4/tcp_max_syn_backlog', '4096')
 
-    def nic_is_bond_iface(self, nic):
-        return self.__nic_is_bond_iface[nic]
-
-    def nic_exists(self, nic):
-        return self.__iface_exists(nic)
-
-    def nic_is_hw_iface(self, nic):
-        return self.__dev_is_hw_iface(nic)
-
-    def slaves(self, nic):
-        """
-        Returns an iterator for all slaves of the nic.
-        If agrs.nic is not a bonding interface an attempt to use the returned iterator
-        will immediately raise a StopIteration exception - use __dev_is_bond_iface() check to avoid this.
-        """
-        return iter(self.__slaves[nic])
+        self.__tune_tcp_mem()
 
 #### Protected methods ##########################
     def _get_irqs(self):
@@ -630,6 +812,38 @@ class NetPerfTuner(PerfTunerBase):
         return itertools.chain.from_iterable(self.__nic2irqs.values())
 
 #### Private methods ############################
+    def __tune_tcp_mem(self):
+        page_size = mmap.PAGESIZE
+        total_mem = psutil.virtual_memory().total
+        # We only tune for physical memory since tcp_mem is virtualized
+        def to_pages(bytes):
+            return math.ceil(bytes / page_size)
+        max = total_mem * self.args.tcp_mem_fraction
+        fwriteln_and_log('/proc/sys/net/ipv4/tcp_mem', f"{to_pages(max / 2)} {to_pages(max * 2/3)} {to_pages(max)}")
+
+    def __nic_is_bond_iface(self, nic):
+        return self.__nic_is_bond_iface_dict.get(nic, False)
+
+    def __nic_is_vlan_iface(self, nic):
+        return self.__nic_is_vlan_iface_dict.get(nic, False)
+
+    def __nic_has_slaves(self, nic):
+        return nic in self.__slaves_dict and len(self.__slaves_dict[nic]) > 0
+
+    def __nic_exists(self, nic):
+        return self.__iface_exists(nic)
+
+    def __nic_is_tunable(self, nic):
+        return self.__dev_is_tunalbe_iface(nic)
+
+    def __slaves(self, nic):
+        """
+        Returns an iterator for all slaves of the nic.
+        If agrs.nic is not a composite interface an attempt to use the returned iterator
+        will immediately raise a StopIteration exception - use __nic_has_slaves(nic) check to avoid this.
+        """
+        return iter(self.__slaves_dict[nic])
+
     def __get_irqs_info(self):
         self.__irqs2procline = get_irqs2procline_map()
         self.__nic2irqs = self.__learn_irqs()
@@ -643,20 +857,26 @@ class NetPerfTuner(PerfTunerBase):
         Checks that self.nics are supported interfaces
         """
         for nic in self.nics:
-            if not self.nic_exists(nic):
+            if not self.__nic_exists(nic):
                 raise Exception("Device {} does not exist".format(nic))
-            if not self.nic_is_hw_iface(nic) and not self.nic_is_bond_iface(nic):
+            if not self.__nic_is_tunable(nic) and not self.__nic_has_slaves(nic):
                 raise Exception("Not supported virtual device {}".format(nic))
 
     def __get_irqs_one(self, iface):
         """
         Returns the list of IRQ numbers for the given interface.
         """
-        return self.__nic2irqs[iface]
+        return self.__nic2irqs.get(iface, [])
 
     def __setup_rfs(self, iface):
         rps_limits = glob.glob("/sys/class/net/{}/queues/*/rps_flow_cnt".format(iface))
-        one_q_limit = int(self.__rfs_table_size / len(rps_limits))
+        sorted_rps_limits = sorted(rps_limits, key=NetPerfTuner.__rx_queue_index)
+
+        # Restrict the handled rps_limits indexes according to the number of Rx queues
+        num_rx_queues = self.__get_rx_queue_count(iface)
+        sorted_rps_limits = sorted_rps_limits[:num_rx_queues]
+
+        one_q_limit = int(self.__rfs_table_size / len(sorted_rps_limits))
 
         # If RFS feature is not present - get out
         try:
@@ -669,7 +889,7 @@ class NetPerfTuner(PerfTunerBase):
         run_one_command(['sysctl', '-w', 'net.core.rps_sock_flow_entries={}'.format(self.__rfs_table_size)])
 
         # Set each RPS queue limit
-        for rfs_limit_cnt in rps_limits:
+        for rfs_limit_cnt in sorted_rps_limits:
             msg = "Setting limit {} in {}".format(one_q_limit, rfs_limit_cnt)
             fwriteln(rfs_limit_cnt, "{}".format(one_q_limit), log_message=msg)
 
@@ -693,7 +913,7 @@ class NetPerfTuner(PerfTunerBase):
         op = "Enable"
         value = 'on'
 
-        if (self.args.enable_arfs is None and self.irqs_cpu_mask == self.cpu_mask) or self.args.enable_arfs is False:
+        if (self.args.enable_arfs is None and self.irqs_cpu_mask != self.cpu_mask) or self.args.enable_arfs is False:
             op = "Disable"
             value = 'off'
 
@@ -728,25 +948,73 @@ class NetPerfTuner(PerfTunerBase):
             return False
         return os.path.exists("/sys/class/net/{}".format(iface))
 
-    def __dev_is_hw_iface(self, iface):
+    def __dev_is_tunalbe_iface(self, iface):
         return os.path.exists("/sys/class/net/{}/device".format(iface))
 
-    def __check_dev_is_bond_iface(self):
-        bond_dict = {}
+    @staticmethod
+    def __get_bond_ifaces():
         if not os.path.exists('/sys/class/net/bonding_masters'):
-            for nic in self.nics:
-                bond_dict[nic] = False
-            #return False for every nic
-            return bond_dict
-        for nic in self.nics:
-            bond_dict[nic] = any([re.search(nic, line) for line in open('/sys/class/net/bonding_masters', 'r').readlines()])
+            return {}
+
+        bond_dict = {}
+        for line in open('/sys/class/net/bonding_masters', 'r').readlines():
+            for nic in line.split():
+                bond_dict[nic] = True
+
         return bond_dict
 
+    @staticmethod
+    def __get_vlan_ifaces():
+        # Each VLAN interface is going to have a corresponding entry in /proc/net/vlan/ directory
+        return {pathlib.PurePath(pathlib.Path(f)).name: True
+                for f in filter(lambda vlan_name: vlan_name != "/proc/net/vlan/config", glob.glob("/proc/net/vlan/*"))}
+
+    def __learn_slaves_one(self, nic):
+        """
+        Learn underlying physical devices a given NIC
+
+        :param nic: An interface to search slaves for
+        """
+        slaves_list = set()
+
+        if self.__nic_is_bond_iface(nic):
+            top_slaves_list = set(itertools.chain.from_iterable(
+                [line.split() for line in open("/sys/class/net/{}/bonding/slaves".format(nic), 'r').readlines()]))
+        else:
+            # Some virtual interfaces (e.g. VLANs) have a symbolic link 'lower_<parent_interface_name>' under
+            # /sys/class/net/<interface name> representing a lower level dependent interface.
+            #
+            # For example:
+            #
+            # lrwxrwxrwx  1 root root    0 Jul  5 18:38 lower_eno1 -> ../../../pci0000:00/0000:00:1f.6/net/eno1/
+            #
+            top_slaves_list = set([pathlib.PurePath(pathlib.Path(f).resolve()).name
+                                   for f in glob.glob(f"/sys/class/net/{nic}/lower_*")])
+
+        # Slaves can themselves have slaves of their own: let's descend (DFS) all the way down to get physical devices.
+        # We don't want to include not-tunable interfaces in the resulting slaves list.
+        # We do want to check if any (tunable or not) slave has slaves of their own that might be tunable.
+        for s in top_slaves_list:
+            # Avoid cycles - should not happen but just in case
+            if s in slaves_list:
+                continue
+
+            if self.__nic_is_tunable(s):
+                slaves_list.add(s)
+
+            slaves_list |= self.__learn_slaves_one(s)
+
+        return slaves_list
+
     def __learn_slaves(self):
+        """
+        Resolve underlying physical devices for interfaces we are requested to configure
+        """
         slaves_list_per_nic = {}
         for nic in self.nics:
-            if self.nic_is_bond_iface(nic):
-                slaves_list_per_nic[nic] = list(itertools.chain.from_iterable([line.split() for line in open("/sys/class/net/{}/bonding/slaves".format(nic), 'r').readlines()]))
+            current_slaves = self.__learn_slaves_one(nic)
+            if current_slaves:
+                slaves_list_per_nic[nic] = list(current_slaves)
 
         return slaves_list_per_nic
 
@@ -766,8 +1034,8 @@ class NetPerfTuner(PerfTunerBase):
         :param irq: IRQ number
         :return: HW queue index for Intel NICs and sys.maxsize for all other NICs
         """
-        intel_fp_irq_re = re.compile("\-TxRx\-(\d+)")
-        fdir_re = re.compile("fdir\-TxRx\-\d+")
+        intel_fp_irq_re = re.compile(r"-TxRx-(\d+)")
+        fdir_re = re.compile(r"fdir-TxRx-\d+")
 
         m = intel_fp_irq_re.search(self.__irqs2procline[irq])
         m1 = fdir_re.search(self.__irqs2procline[irq])
@@ -791,8 +1059,8 @@ class NetPerfTuner(PerfTunerBase):
         :param irq: IRQ number
         :return: HW queue index for Mellanox NICs and sys.maxsize for all other NICs
         """
-        mlx5_fp_irq_re = re.compile("mlx5_comp(\d+)")
-        mlx4_fp_irq_re = re.compile("mlx4\-(\d+)")
+        mlx5_fp_irq_re = re.compile(r"mlx5_comp(\d+)")
+        mlx4_fp_irq_re = re.compile(r"mlx4-(\d+)")
 
         m5 = mlx5_fp_irq_re.search(self.__irqs2procline[irq])
         if m5:
@@ -801,6 +1069,30 @@ class NetPerfTuner(PerfTunerBase):
             m4 = mlx4_fp_irq_re.search(self.__irqs2procline[irq])
             if m4:
                 return int(m4.group(1))
+
+        return sys.maxsize
+
+    def __mana_irq_to_queue_idx(self, irq):
+        """
+        Return the HW queue index for a given IRQ for Microsoft Azure Network Adapter (MANA) NICs in order to sort the
+        IRQs' list by this index.
+
+        MANA NICs have the IRQ which name looks like this:
+             mana_hwc@...
+             mana_q<index>@...
+
+        We don't care much about 'mana_hwc' IRQs since they are a slow path event IRQs.
+        mana_q<index> IRQs are the fast path queues IRQs.
+        Therefore, we will order HWC IRQs to always be the last in the sorted IRQs' list.
+
+        :param irq: IRQ number
+        :return: HW queue index for MANA NICs and sys.maxsize for all other NICs
+        """
+        mana_fp_irq_re = re.compile(r"\s+mana_q(\d+)")
+
+        m = mana_fp_irq_re.search(self.__irqs2procline[irq])
+        if m:
+            return int(m.group(1))
 
         return sys.maxsize
 
@@ -863,6 +1155,7 @@ class NetPerfTuner(PerfTunerBase):
                       or for mlx5
                       mlx5_comp<queue idx>@<bla-bla>
           - VIRTIO: virtioN-[input|output].D
+          - MANA: mana_q<queue idx>@<bla-bla>
 
         So, we will try to filter the etries in /proc/interrupts for IRQs we've got from get_all_irqs_one()
         according to the patterns above.
@@ -877,7 +1170,7 @@ class NetPerfTuner(PerfTunerBase):
         """
         # filter 'all_irqs' to only reference valid keys from 'irqs2procline' and avoid an IndexError on the 'irqs' search below
         all_irqs = set(learn_all_irqs_one("/sys/class/net/{}/device".format(iface), self.__irqs2procline, iface)).intersection(self.__irqs2procline.keys())
-        fp_irqs_re = re.compile("\-TxRx\-|\-fp\-|\-Tx\-Rx\-|mlx4-\d+@|mlx5_comp\d+@|virtio\d+-(input|output)")
+        fp_irqs_re = re.compile(r"-TxRx-|-fp-|-Tx-Rx-|mlx4-\d+@|mlx5_comp\d+@|virtio\d+-(input|output)|mana_q\d+@")
         irqs = sorted(list(filter(lambda irq : fp_irqs_re.search(self.__irqs2procline[irq]), all_irqs)))
         if irqs:
             irqs.sort(key=self.__get_irq_to_queue_idx_functor(iface))
@@ -911,6 +1204,8 @@ class NetPerfTuner(PerfTunerBase):
             irq_to_idx_func = self.__mlx_irq_to_queue_idx
         elif driver_name.startswith("virtio"):
             irq_to_idx_func = self.__virtio_irq_to_queue_idx
+        elif driver_name.startswith("mana"):
+            irq_to_idx_func = self.__mana_irq_to_queue_idx
 
         return irq_to_idx_func
 
@@ -945,22 +1240,63 @@ class NetPerfTuner(PerfTunerBase):
         """
         nic_irq_dict={}
         for nic in self.nics:
-            if self.nic_is_bond_iface(nic):
-                for slave in filter(self.__dev_is_hw_iface, self.slaves(nic)):
+            if self.__nic_has_slaves(nic):
+                # Slaves should not include not-tunable interfaces but just in case let's filter them out for safety
+                for slave in filter(self.__dev_is_tunalbe_iface, self.__slaves(nic)):
                     nic_irq_dict[slave] = self.__learn_irqs_one(slave)
             else:
                 nic_irq_dict[nic] = self.__learn_irqs_one(nic)
         return nic_irq_dict
 
+    @staticmethod
+    def __rx_queue_index(path):
+        """
+        Retrieves an index from paths like /<something>/.../rx-N/<something else>/...,
+        e.g. /sys/class/net/<iface>/queues/rx-N/rps_cpus
+        where N is an integer.
+
+        For paths that don't match the pattern above a very big integer value is going to be returned.
+        This will result in matching paths to appear first and ordered if this function is used as a sorting key for
+        a list of paths.
+        """
+        m = re.search(r"/rx-(\d+)/", path)
+        return int(m.group(1)) if m else sys.maxsize
+
     def __get_rps_cpus(self, iface):
         """
-        Prints all rps_cpus files names for the given HW interface.
+        Returns all rps_cpus files names for the given HW interface.
 
         There is a single rps_cpus file for each RPS queue and there is a single RPS
         queue for each HW Rx queue. Each HW Rx queue should have an IRQ.
-        Therefore the number of these files is equal to the number of fast path Rx IRQs for this interface.
+        Therefore, the number of these files is equal to the number of fast path Rx IRQs for this interface.
+
+        The only known exception is a Mellanox mlx5 driver that was breaking this invariant in kernel/driver versions
+        5.3-6.0 by doubling the number of RPS queues in order to serve XSK by the higher RPS queues and RSS by the lower
+        ones.
         """
-        return glob.glob("/sys/class/net/{}/queues/*/rps_cpus".format(iface))
+        all_rps_cpus = glob.glob("/sys/class/net/{}/queues/*/rps_cpus".format(iface))
+        sorted_rps_cpus = sorted(all_rps_cpus, key=NetPerfTuner.__rx_queue_index)
+
+        # Take a special care of mlx5 devices: they double the number of RPS CPUs in kernel/driver versions 5.3-6.0
+        # in order to serve XSK by the higher RPS queues and RSS by the lower ones.
+        # The RSS queues count corresponds to the used "combined" value returned by 'ethtool -l <iface>'.
+        #
+        # The sanity was restored by this commit:
+        #
+        # commit 3db4c85cde7a514a5277070b32e776dbefcaa838
+        # Author: Maxim Mikityanskiy <maxtram95@gmail.com>
+        # Date:   Fri Sep 30 09:29:03 2022 -0700
+        #
+        #     net/mlx5e: xsk: Use queue indices starting from 0 for XSK queues
+        #
+        if self.__get_driver_name(iface).startswith("mlx5"):
+            ethtool_l_data = self.__get_ethtool_l_info(iface)
+            if (ethtool_l_data.current_hardware_settings.combined is not None and
+                    ethtool_l_data.current_hardware_settings.combined * 2 == len(sorted_rps_cpus)):
+                sorted_rps_cpus = sorted_rps_cpus[:ethtool_l_data.current_hardware_settings.combined]
+
+        return sorted_rps_cpus
+
 
     def __set_rx_channels_count(self, iface, count):
         """
@@ -995,7 +1331,7 @@ class NetPerfTuner(PerfTunerBase):
 
         return False
 
-    def __setup_one_hw_iface(self, iface):
+    def __setup_one_tunable_iface(self, iface):
         # Set Rx channels count to a number of IRQ CPUs unless an explicit count is given
         if self.args.num_rx_queues is not None:
             num_rx_channels = self.args.num_rx_queues
@@ -1025,6 +1361,10 @@ class NetPerfTuner(PerfTunerBase):
         # For such NICs we've sorted IRQs list so that IRQs that handle Rx are all at the head of the list.
         if rx_channels_set or max_num_rx_queues < len(all_irqs):
             num_rx_queues = self.__get_rx_queue_count(iface)
+            # Let's be optimistic during a dry run and assume that the RX channels setting was successful
+            if dry_run_mode:
+                num_rx_queues = num_rx_channels
+
             tcp_irqs_lower_bound = self.__irq_lower_bound_by_queue(iface, all_irqs, num_rx_queues)
             perftune_print(f"Distributing IRQs handling Rx and Tx for first {num_rx_queues} channels:")
             distribute_irqs(all_irqs[0:tcp_irqs_lower_bound], self.irqs_cpu_mask)
@@ -1037,11 +1377,15 @@ class NetPerfTuner(PerfTunerBase):
         self.__setup_rps(iface, self.cpu_mask)
         self.__setup_xps(iface)
 
-    def __setup_bonding_iface(self, nic):
-        for slave in self.slaves(nic):
-            if self.__dev_is_hw_iface(slave):
+    def __setup_virtual_iface(self, nic):
+        """
+        Set up the interface which is a bond or a VLAN interface
+        :param nic: name of a composite interface to set up
+        """
+        for slave in self.__slaves(nic):
+            if self.__dev_is_tunalbe_iface(slave):
                 perftune_print("Setting up {}...".format(slave))
-                self.__setup_one_hw_iface(slave)
+                self.__setup_one_tunable_iface(slave)
             else:
                 perftune_print("Skipping {} (not a physical slave device?)".format(slave))
 
@@ -1099,8 +1443,10 @@ class ClocksourceManager:
     def _get_arch(self):
         try:
             virt = run_read_only_command(['systemd-detect-virt']).strip()
-            if virt == "kvm":
-                return virt
+            # According to https://www.freedesktop.org/software/systemd/man/latest/systemd-detect-virt.html
+            # 'amazon' and 'google' are returned for KVM guests.
+            if virt in ["kvm", "amazon", "google"]:
+                return "kvm"
         except:
             pass
         return platform.machine()
@@ -1387,7 +1733,7 @@ class DiskPerfTuner(PerfTunerBase):
                 #      /sys/devices/pci0000:00/0000:00:02.0/0000:02:00.0/host6/target6:2:0/6:2:0:0/block/sda/sda1
                 # We want only the path till the last BDF including - it contains the IRQs information.
 
-                patt = re.compile("^[0-9ABCDEFabcdef]{4}\:[0-9ABCDEFabcdef]{2}\:[0-9ABCDEFabcdef]{2}\.[0-9ABCDEFabcdef]$")
+                patt = re.compile(r"^[0-9ABCDEFabcdef]{4}:[0-9ABCDEFabcdef]{2}:[0-9ABCDEFabcdef]{2}\.[0-9ABCDEFabcdef]$")
                 for split_sys_path_branch in split_sys_path[4:]:
                     if patt.search(split_sys_path_branch):
                         controller_path_parts.append(split_sys_path_branch)
@@ -1507,6 +1853,10 @@ class TuneModes(enum.Enum):
     def names():
         return list(TuneModes.__members__.keys())
 
+# Seastar defaults to allocating 93% of physical memory. The kernel's default allocation for TCP is ~9%. This adds up
+# to 102%. Reduce the TCP allocation to 3% to avoid OOM.
+default_tcp_mem_fraction = 0.03
+
 argp = argparse.ArgumentParser(description = 'Configure various system parameters in order to improve the seastar application performance.', formatter_class=argparse.RawDescriptionHelpFormatter,
                                epilog=
 '''
@@ -1534,7 +1884,7 @@ Modes description:
 
  If there isn't any mode given script will use a default mode:
     - If number of CPU cores is greater than 16, allocate a single IRQ CPU core for each 16 CPU cores in 'cpu_mask'.
-      IRQ cores are going to be allocated evenly on available NUMA nodes according to 'cpu_mask' value.  
+      IRQ cores are going to be allocated evenly on available NUMA nodes according to 'cpu_mask' value.
     - If number of physical CPU cores per Rx HW queue is greater than 4 and less than 16 - use the 'sq-split' mode.
     - Otherwise, if number of hyper-threads per Rx HW queue is greater than 4 - use the 'sq' mode.
     - Otherwise use the 'mq' mode.
@@ -1569,6 +1919,7 @@ argp.add_argument('--irq-core-auto-detection-ratio', help="Use a given ratio for
                                                           "CPU cores out of available according to a 'cpu_mask' value."
                                                           "Default is 16",
                   type=int, default=16, dest='cores_per_irq_core')
+argp.add_argument('--tcp-mem-fraction', default=default_tcp_mem_fraction, type=float, help="Fraction of total memory to allocate for TCP buffers")
 
 def parse_cpu_mask_from_yaml(y, field_name, fname):
     hex_32bit_pattern='0x[0-9a-fA-F]{1,8}'
@@ -1763,6 +2114,10 @@ except PerfTunerBase.CPUMaskIsZeroException as e:
         perftune_print("0x0")
     else:
         sys.exit("ERROR: {}. Your system can't be tuned until the issue is fixed.".format(e))
+except PerfTunerBase.InvalidNUMATopologyException as e:
+    print("ERROR: {}. Your system can't be tuned until the issue is fixed.".format(e), file=sys.stderr)
+    # set special exit code to handle InvalidNUMATopologyException from the caller script
+    sys.exit(3)
 except Exception as e:
     sys.exit("ERROR: {}. Your system can't be tuned until the issue is fixed.".format(e))
 

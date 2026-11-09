@@ -20,16 +20,18 @@
  */
 #pragma once
 
+#include <seastar/core/format.hh>
+#include <seastar/core/byteorder.hh>
 #include <seastar/core/function_traits.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/util/assert.hh>
 #include <seastar/util/is_smart_ptr.hh>
-#include <seastar/core/simple-stream.hh>
-#include <boost/range/numeric.hpp>
-#include <boost/range/adaptor/transformed.hpp>
-#include <seastar/net/packet-data-source.hh>
-#include <seastar/core/print.hh>
+#include <seastar/util/log.hh>
+#include <seastar/core/deleter.hh>
+
+#include <concepts>
 
 namespace seastar {
 
@@ -241,7 +243,11 @@ struct marshall_one {
             auto do_do_marshall = [&serializer, &out] (const auto&... args) {
                 do_marshall(serializer, out, args...);
             };
-            std::apply(do_do_marshall, arg);
+            // since C++23, std::apply() only accepts tuple-like types, while
+            // rpc::tuple is not a tuple-like type from the tuple-like C++
+            // concept's perspective. so we have to cast it to std::tuple to
+            // appease std::apply()
+            std::apply(do_do_marshall, static_cast<const std::tuple<T...>&>(arg));
         }
     };
 };
@@ -276,17 +282,25 @@ inline snd_buf marshall(Serializer& serializer, size_t head_space, const T&... a
 template <typename Serializer, typename Input, typename... T>
 std::tuple<T...> do_unmarshall(connection& c, Input& in);
 
+// The protocol to call the serializer is read(serializer, stream, rpc::type<T>).
+template <typename T, typename... Args>
+requires requires (Args... args, type<T> t) { read(std::forward<Args>(args)..., t); }
+auto
+read_via_type_marker(Args&&... args) {
+    return read(std::forward<Args>(args)..., type<T>());
+}
+
 template<typename Serializer, typename Input>
 struct unmarshal_one {
     template<typename T> struct helper {
         static T doit(connection& c, Input& in) {
-            return read(c.serializer<Serializer>(), in, type<T>());
+            return read_via_type_marker<T>(c.serializer<Serializer>(), in);
         }
     };
     template<typename T> struct helper<optional<T>> {
         static optional<T> doit(connection& c, Input& in) {
             if (in.size()) {
-                return optional<T>(read(c.serializer<Serializer>(), in, type<typename remove_optional<T>::type>()));
+                return optional<T>(read_via_type_marker<typename remove_optional<T>::type>(c.serializer<Serializer>(), in));
             } else {
                 return optional<T>();
             }
@@ -304,12 +318,12 @@ struct unmarshal_one {
     }
     template<typename... T> struct helper<sink<T...>> {
         static sink<T...> doit(connection& c, Input& in) {
-            return sink<T...>(make_shared<sink_impl<Serializer, T...>>(c.get_stream(get_connection_id(in))));
+            return sink<T...>(make_shared<internal::sink_impl<Serializer, T...>>(c.get_stream(get_connection_id(in))));
         }
     };
     template<typename... T> struct helper<source<T...>> {
         static source<T...> doit(connection& c, Input& in) {
-            return source<T...>(make_shared<source_impl<Serializer, T...>>(c.get_stream(get_connection_id(in))));
+            return source<T...>(make_shared<internal::source_impl<Serializer, T...>>(c.get_stream(get_connection_id(in))));
         }
     };
     template <typename... T> struct helper<tuple<T...>> {
@@ -319,18 +333,86 @@ struct unmarshal_one {
     };
 };
 
+template <typename... T>
+struct default_constructible_tuple_except_first;
+
+template <>
+struct default_constructible_tuple_except_first<> {
+    using type = std::tuple<>;
+};
+
+template <typename T0, typename... T>
+struct default_constructible_tuple_except_first<T0, T...> {
+    using type = std::tuple<
+            T0,
+            std::conditional_t<
+                    std::is_default_constructible_v<T>,
+                    T,
+                    std::optional<T>
+            >...
+        >;
+};
+
+template <typename... T>
+using default_constructible_tuple_except_first_t = typename default_constructible_tuple_except_first<T...>::type;
+
+// Where Tin != Tout, apply std:optional::value()
+template <typename... Tout, typename... Tin>
+auto
+unwrap_optional_if_needed(std::tuple<Tin...>&& tuple_in) {
+    using tuple_in_t = std::tuple<Tin...>;
+    using tuple_out_t = std::tuple<Tout...>;
+    return std::invoke([&] <size_t... Idx> (std::index_sequence<Idx...>) {
+        return tuple_out_t(
+            std::invoke([&] () {
+                if constexpr (std::same_as<std::tuple_element_t<Idx, tuple_in_t>, std::tuple_element_t<Idx, tuple_out_t>>) {
+                    return std::move(std::get<Idx>(tuple_in));
+                } else {
+                    return std::move(std::get<Idx>(tuple_in).value());
+                }
+            })...);
+    }, std::make_index_sequence<sizeof...(Tout)>());
+}
+
 template <typename Serializer, typename Input, typename... T>
 inline std::tuple<T...> do_unmarshall(connection& c, Input& in) {
     // Argument order processing is unspecified, but we need to deserialize
     // left-to-right. So we deserialize into something that can be lazily
     // constructed (and can conditionally destroy itself if we only constructed some
     // of the arguments).
-    std::tuple<std::optional<T>...> temporary;
-    return std::apply([&] (auto&... args) {
-        // Comma-expression preserves left-to-right order
-        (..., (args = unmarshal_one<Serializer, Input>::template helper<typename std::remove_reference_t<decltype(args)>::value_type>::doit(c, in)));
-        return std::tuple(std::move(*args)...);
-    }, temporary);
+    //
+    // The first element of the tuple has no ordering
+    // problem, and we can deserialize directly into a std::tuple<T...>.
+    //
+    // For the rest of the elements, if they are default-constructible, we leave
+    // them as is, and if not, we deserialize into std::optional<T>, and later
+    // unwrap them. If we're lucky and nothing was wrapped, we can return without
+    // any data movement.
+    using ret_type = std::tuple<T...>;
+    using temporary_type = default_constructible_tuple_except_first_t<T...>;
+    return std::invoke([&] <size_t... Idx> (std::index_sequence<Idx...>) {
+        auto tmp = temporary_type(
+            std::invoke([&] () -> std::tuple_element_t<Idx, temporary_type> {
+                if constexpr (Idx == 0) {
+                    // The first T has no ordering problem, so we can deserialize it directly into the tuple
+                    return unmarshal_one<Serializer, Input>::template helper<std::tuple_element_t<Idx, ret_type>>::doit(c, in);
+                } else {
+                    // Use default constructor for the rest of the Ts
+                    return {};
+                }
+            })...
+        );
+        // Deserialize the other Ts, comma-expression preserves left-to-right order.
+        (void)(...,  ((Idx == 0
+            ? 0
+            : ((std::get<Idx>(tmp) = unmarshal_one<Serializer, Input>::template helper<std::tuple_element_t<Idx, ret_type>>::doit(c, in), 0)))));
+        if constexpr (std::same_as<ret_type, temporary_type>) {
+            // Use Named Return Vale Optimization (NVRO) if we didn't have to wrap anything
+            return tmp;
+        } else {
+            return unwrap_optional_if_needed<T...>(std::move(tmp));
+        }
+    }, std::index_sequence_for<T...>());
 }
 
 template <typename Serializer, typename... T>
@@ -376,7 +458,7 @@ struct rcv_reply_base  {
     template<typename... V>
     void set_value(V&&... v) {
         done = true;
-        p.set_value(internal::untuple(std::forward<V>(v))...);
+        p.set_value(seastar::internal::untuple(std::forward<V>(v))...);
     }
     ~rcv_reply_base() {
         if (!done) {
@@ -410,7 +492,7 @@ template<typename Serializer>
 struct rcv_reply<Serializer, future<>> : rcv_reply<Serializer, void> {};
 
 template <typename Serializer, typename Ret, typename... InArgs>
-inline auto wait_for_reply(wait_type, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, rpc::client& dst, id_type msg_id,
+inline auto wait_for_reply(wait_type, std::optional<rpc_clock_type::time_point> timeout, rpc_clock_type::time_point start, cancellable* cancel, rpc::client& dst, id_type msg_id,
         signature<Ret (InArgs...)>) {
     using reply_type = rcv_reply<Serializer, Ret>;
     auto lambda = [] (reply_type& r, rpc::client& dst, id_type msg_id, rcv_buf data) mutable {
@@ -425,19 +507,20 @@ inline auto wait_for_reply(wait_type, std::optional<rpc_clock_type::time_point> 
     };
     using handler_type = typename rpc::client::template reply_handler<reply_type, decltype(lambda)>;
     auto r = std::make_unique<handler_type>(std::move(lambda));
+    r->start = start;
     auto fut = r->reply.p.get_future();
     dst.wait_for_reply(msg_id, std::move(r), timeout, cancel);
     return fut;
 }
 
 template<typename Serializer, typename... InArgs>
-inline auto wait_for_reply(no_wait_type, std::optional<rpc_clock_type::time_point>, cancellable*, rpc::client&, id_type,
+inline auto wait_for_reply(no_wait_type, std::optional<rpc_clock_type::time_point>, rpc_clock_type::time_point start, cancellable*, rpc::client&, id_type,
         signature<no_wait_type (InArgs...)>) {  // no_wait overload
     return make_ready_future<>();
 }
 
 template<typename Serializer, typename... InArgs>
-inline auto wait_for_reply(no_wait_type, std::optional<rpc_clock_type::time_point>, cancellable*, rpc::client&, id_type,
+inline auto wait_for_reply(no_wait_type, std::optional<rpc_clock_type::time_point>, rpc_clock_type::time_point, cancellable*, rpc::client&, id_type,
         signature<future<no_wait_type> (InArgs...)>) {  // future<no_wait> overload
     return make_ready_future<>();
 }
@@ -454,55 +537,117 @@ relative_timeout_to_absolute(rpc_clock_type::duration relative) {
 // Refer to struct request_frame for more details
 static constexpr size_t request_frame_headroom = 28;
 
+namespace internal {
+
+// The function object that make_client() returns (see send_helper()). It is a
+// class template, and not a local class in send_helper(), because the member
+// functions of a local class are instantiated together with the function
+// that defines it, while those of a class template are only instantiated
+// when they are used. So creating one, like register_handler() does, doesn't
+// instantiate the code that sends a message unless someone does send it.
+template<typename Serializer, typename MsgType, typename Ret, typename... InArgs>
+struct send_function {
+    MsgType t;
+    signature<Ret (InArgs...)> sig;
+    auto send(rpc::client& dst, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, const InArgs&... args) {
+        if (dst.error()) {
+            using cleaned_ret_type = typename wait_signature<Ret>::cleaned_type;
+            return futurize<cleaned_ret_type>::make_exception_future(closed_error());
+        }
+
+        auto start = rpc_clock_type::now();
+        // send message
+        auto msg_id = dst.next_message_id();
+        snd_buf data = marshall(dst.template serializer<Serializer>(), request_frame_headroom, args...);
+
+        // prepare reply handler, if return type is now_wait_type this does nothing, since no reply will be sent
+        using wait = wait_signature_t<Ret>;
+        auto sent = dst.request(uint64_t(t), msg_id, std::move(data), timeout, cancel);
+        auto reply = wait_for_reply<Serializer>(wait(), timeout, start, cancel, dst, msg_id, sig);
+        // Return the reply's future once the request is sent; a failure to
+        // send is ignored.
+        return sent.then_wrapped([reply = std::move(reply)] (future<> f) mutable {
+            f.ignore_ready_future();
+            return std::move(reply); // return future of wait_for_reply
+        });
+    }
+    auto operator()(rpc::client& dst, const InArgs&... args) {
+        return send(dst, {}, nullptr, args...);
+    }
+    auto operator()(rpc::client& dst, rpc_clock_type::time_point timeout, const InArgs&... args) {
+        return send(dst, timeout, nullptr, args...);
+    }
+    auto operator()(rpc::client& dst, rpc_clock_type::time_point timeout, cancellable& cancel, const InArgs&... args) {
+        return send(dst, timeout, &cancel, args...);
+    }
+    auto operator()(rpc::client& dst, rpc_clock_type::duration timeout, const InArgs&... args) {
+        return send(dst, relative_timeout_to_absolute(timeout), nullptr, args...);
+    }
+    auto operator()(rpc::client& dst, rpc_clock_type::duration timeout, cancellable& cancel, const InArgs&... args) {
+        return send(dst, relative_timeout_to_absolute(timeout), &cancel, args...);
+    }
+    auto operator()(rpc::client& dst, cancellable& cancel, const InArgs&... args) {
+        return send(dst, {}, &cancel, args...);
+    }
+
+};
+
+}
+
 // Returns lambda that can be used to send rpc messages.
 // The lambda gets client connection and rpc parameters as arguments, marshalls them sends
 // to a server and waits for a reply. After receiving reply it unmarshalls it and signal completion
 // to a caller.
 template<typename Serializer, typename MsgType, typename Ret, typename... InArgs>
 auto send_helper(MsgType xt, signature<Ret (InArgs...)> xsig) {
-    struct shelper {
-        MsgType t;
-        signature<Ret (InArgs...)> sig;
-        auto send(rpc::client& dst, std::optional<rpc_clock_type::time_point> timeout, cancellable* cancel, const InArgs&... args) {
-            if (dst.error()) {
-                using cleaned_ret_type = typename wait_signature<Ret>::cleaned_type;
-                return futurize<cleaned_ret_type>::make_exception_future(closed_error());
-            }
-
-            // send message
-            auto msg_id = dst.next_message_id();
-            snd_buf data = marshall(dst.template serializer<Serializer>(), request_frame_headroom, args...);
-
-            // prepare reply handler, if return type is now_wait_type this does nothing, since no reply will be sent
-            using wait = wait_signature_t<Ret>;
-            return when_all(dst.request(uint64_t(t), msg_id, std::move(data), timeout, cancel), wait_for_reply<Serializer>(wait(), timeout, cancel, dst, msg_id, sig)).then([] (auto r) {
-                    std::get<0>(r).ignore_ready_future();
-                    return std::move(std::get<1>(r)); // return future of wait_for_reply
-            });
-        }
-        auto operator()(rpc::client& dst, const InArgs&... args) {
-            return send(dst, {}, nullptr, args...);
-        }
-        auto operator()(rpc::client& dst, rpc_clock_type::time_point timeout, const InArgs&... args) {
-            return send(dst, timeout, nullptr, args...);
-        }
-        auto operator()(rpc::client& dst, rpc_clock_type::duration timeout, const InArgs&... args) {
-            return send(dst, relative_timeout_to_absolute(timeout), nullptr, args...);
-        }
-        auto operator()(rpc::client& dst, cancellable& cancel, const InArgs&... args) {
-            return send(dst, {}, &cancel, args...);
-        }
-
-    };
-    return shelper{xt, xsig};
+    return internal::send_function<Serializer, MsgType, Ret, InArgs...>{xt, xsig};
 }
 
 // Refer to struct response_frame for more details
-static constexpr size_t response_frame_headroom = 12;
+static constexpr size_t response_frame_headroom = 16;
+
+namespace internal {
+
+// Returns the reply to a request whose handler failed with the given exception.
+snd_buf make_error_reply(std::exception_ptr eptr);
+
+// Replies to a request that failed with the given exception before its
+// handler was called: like reply() with a failed future, but it doesn't
+// depend on the handler's return type. want_reply is false for handlers
+// returning no_wait_type, which don't get a reply.
+future<> reply_with_error(bool want_reply, std::exception_ptr eptr, uint64_t verb, int64_t msg_id,
+        shared_ptr<server::connection> client, std::optional<rpc_clock_type::time_point> timeout);
+
+// Logs the exception, if the reply to a request fails, and keeps the
+// request's resource permit until it completes.
+future<> log_reply_exception(future<>&& reply, uint64_t verb, int64_t msg_id, shared_ptr<server::connection>&& client,
+        resource_permit&& permit);
+
+// The part of handling a request on the server that depends on the handler's
+// signature: unmarshall the arguments from the request's data, call the
+// handler, and reply with its result.
+class request_handler {
+public:
+    virtual future<> handle(shared_ptr<server::connection>& client, std::optional<rpc_clock_type::time_point> timeout,
+            int64_t msg_id, rcv_buf&& data, resource_permit&& permit) = 0;
+protected:
+    ~request_handler() = default;
+};
+
+// Handles a request on the server: everything that doesn't depend on the
+// handler's signature - checking the request's size, waiting for resources,
+// entering the reply gate and logging errors - calling handler for the rest.
+// This way it isn't instantiated again for every handler. handler is kept by
+// reference, and must live until the request is handled.
+future<> handle_request(shared_ptr<server::connection>&& client, std::optional<rpc_clock_type::time_point> timeout,
+        int64_t msg_id, rcv_buf&& data, gate::holder&& guard, uint64_t verb, bool want_reply,
+        request_handler& handler);
+
+}
 
 template<typename Serializer, typename RetTypes>
-inline future<> reply(wait_type, future<RetTypes>&& ret, int64_t msg_id, shared_ptr<server::connection> client,
-        std::optional<rpc_clock_type::time_point> timeout) {
+inline future<> reply(wait_type, future<RetTypes>&& ret, uint64_t verb, int64_t msg_id, shared_ptr<server::connection> client,
+        std::optional<rpc_clock_type::time_point> timeout, std::optional<rpc_clock_type::duration> handler_duration) {
     if (!client->error()) {
         snd_buf data;
         try {
@@ -510,22 +655,14 @@ inline future<> reply(wait_type, future<RetTypes>&& ret, int64_t msg_id, shared_
                 ret.get();
                 data = std::invoke(marshall<Serializer>, std::ref(client->template serializer<Serializer>()), response_frame_headroom);
             } else {
-                data = std::invoke(marshall<Serializer, const RetTypes&>, std::ref(client->template serializer<Serializer>()), response_frame_headroom, std::move(ret.get0()));
+                data = std::invoke(marshall<Serializer, const RetTypes&>, std::ref(client->template serializer<Serializer>()), response_frame_headroom, std::move(ret.get()));
             }
-        } catch (std::exception& ex) {
-            uint32_t len = std::strlen(ex.what());
-            data = snd_buf(response_frame_headroom + 2 * sizeof(uint32_t) + len);
-            auto os = make_serializer_stream(data);
-            os.skip(response_frame_headroom);
-            uint32_t v32 = cpu_to_le(uint32_t(exception_type::USER));
-            os.write(reinterpret_cast<char*>(&v32), sizeof(v32));
-            v32 = cpu_to_le(len);
-            os.write(reinterpret_cast<char*>(&v32), sizeof(v32));
-            os.write(ex.what(), len);
+        } catch (...) {
+            data = internal::make_error_reply(std::current_exception());
             msg_id = -msg_id;
         }
 
-        return client->respond(msg_id, std::move(data), timeout);
+        return client->respond(msg_id, std::move(data), timeout, handler_duration);
     } else {
         ret.ignore_ready_future();
         return make_ready_future<>();
@@ -534,11 +671,12 @@ inline future<> reply(wait_type, future<RetTypes>&& ret, int64_t msg_id, shared_
 
 // specialization for no_wait_type which does not send a reply
 template<typename Serializer>
-inline future<> reply(no_wait_type, future<no_wait_type>&& r, int64_t msgid, shared_ptr<server::connection> client, std::optional<rpc_clock_type::time_point>) {
+inline future<> reply(no_wait_type, future<no_wait_type>&& r, uint64_t verb, int64_t msgid, shared_ptr<server::connection> client,
+        std::optional<rpc_clock_type::time_point>, std::optional<rpc_clock_type::duration>) {
     try {
         r.get();
-    } catch (std::exception& ex) {
-        client->get_logger()(client->info(), msgid, to_sstring("exception \"") + ex.what() + "\" in no_wait handler ignored");
+    } catch (...) {
+        client->get_logger()(client->info(), msgid, ::seastar::format("exception \"{}\" in no_wait handler of the verb {} ignored", seastar::formattable(std::current_exception()), verb));
     }
     return make_ready_future<>();
 }
@@ -561,62 +699,49 @@ auto lref_to_cref(T& x) {
 }
 
 // Creates lambda to handle RPC message on a server.
-// The lambda unmarshalls all parameters, calls a handler, marshall return values and sends them back to a client
+// The lambda unmarshalls all parameters, calls a handler, marshall return values and sends them back to a client.
+// Only that is done here; the rest, which doesn't depend on the handler's signature, is in internal::handle_request().
 template <typename Serializer, typename Func, typename Ret, typename... InArgs, typename WantClientInfo, typename WantTimePoint>
-auto recv_helper(signature<Ret (InArgs...)> sig, Func&& func, WantClientInfo, WantTimePoint) {
+auto recv_helper(uint64_t verb, signature<Ret (InArgs...)> sig, Func&& func, WantClientInfo, WantTimePoint) {
     using signature = decltype(sig);
     using wait_style = wait_signature_t<Ret>;
-    return [func = lref_to_cref(std::forward<Func>(func))](shared_ptr<server::connection> client,
-                                                           std::optional<rpc_clock_type::time_point> timeout,
-                                                           int64_t msg_id,
-                                                           rcv_buf data) mutable {
-        auto memory_consumed = client->estimate_request_size(data.size);
-        if (memory_consumed > client->max_request_size()) {
-            auto err = format("request size {:d} large than memory limit {:d}", memory_consumed, client->max_request_size());
-            client->get_logger()(client->peer_address(), err);
-            // FIXME: future is discarded
-            (void)try_with_gate(client->get_server().reply_gate(), [client, timeout, msg_id, err = std::move(err)] {
-                return reply<Serializer>(wait_style(), futurize<Ret>::make_exception_future(std::runtime_error(err.c_str())), msg_id, client, timeout).handle_exception([client, msg_id] (std::exception_ptr eptr) {
-                    client->get_logger()(client->info(), msg_id, format("got exception while processing an oversized message: {}", eptr));
-                });
-            }).handle_exception_type([] (gate_closed_exception&) {/* ignore */});
-            return make_ready_future();
+    using handler_func = decltype(lref_to_cref(std::forward<Func>(func)));
+    // The signature-dependent part of handling a request.
+    class handler final : public internal::request_handler {
+        uint64_t _verb;
+        handler_func _func;
+    public:
+        handler(uint64_t verb, handler_func func) : _verb(verb), _func(std::move(func)) {}
+        future<> handle(shared_ptr<server::connection>& client, std::optional<rpc_clock_type::time_point> timeout,
+                int64_t msg_id, rcv_buf&& data, resource_permit&& permit) override {
+            auto args = unmarshall<Serializer, InArgs...>(*client, std::move(data));
+            auto start = rpc_clock_type::now();
+            return apply(_func, client->info(), timeout, WantClientInfo(), WantTimePoint(), signature(), std::move(args)).then_wrapped([verb = _verb, client, timeout, msg_id, permit = std::move(permit), start] (futurize_t<Ret> ret) mutable {
+                return internal::log_reply_exception(reply<Serializer>(wait_style(), std::move(ret), verb, msg_id, client, timeout, rpc_clock_type::now() - start),
+                        verb, msg_id, std::move(client), std::move(permit));
+            });
         }
-        // note: apply is executed asynchronously with regards to networking so we cannot chain futures here by doing "return apply()"
-        auto f = client->wait_for_resources(memory_consumed, timeout).then([client, timeout, msg_id, data = std::move(data), &func] (auto permit) mutable {
-                // FIXME: future is discarded
-                (void)try_with_gate(client->get_server().reply_gate(), [client, timeout, msg_id, data = std::move(data), permit = std::move(permit), &func] () mutable {
-                    try {
-                        auto args = unmarshall<Serializer, InArgs...>(*client, std::move(data));
-                        return apply(func, client->info(), timeout, WantClientInfo(), WantTimePoint(), signature(), std::move(args)).then_wrapped([client, timeout, msg_id, permit = std::move(permit)] (futurize_t<Ret> ret) mutable {
-                            return reply<Serializer>(wait_style(), std::move(ret), msg_id, client, timeout).handle_exception([permit = std::move(permit), client, msg_id] (std::exception_ptr eptr) {
-                                client->get_logger()(client->info(), msg_id, format("got exception while processing a message: {}", eptr));
-                            });
-                        });
-                    } catch (...) {
-                        client->get_logger()(client->info(), msg_id, format("caught exception while processing a message: {}", std::current_exception()));
-                        return make_ready_future();
-                    }
-                }).handle_exception_type([] (gate_closed_exception&) {/* ignore */});
-        });
-
-        if (timeout) {
-            f = f.handle_exception_type([] (semaphore_timed_out&) { /* ignore */ });
-        }
-
-        return f;
+    };
+    return [verb, h = handler(verb, lref_to_cref(std::forward<Func>(func)))](shared_ptr<server::connection> client,
+                                                                          std::optional<rpc_clock_type::time_point> timeout,
+                                                                          int64_t msg_id,
+                                                                          rcv_buf data,
+                                                                          gate::holder guard) mutable {
+        return internal::handle_request(std::move(client), timeout, msg_id, std::move(data), std::move(guard), verb,
+                std::is_same_v<wait_style, wait_type>, h);
     };
 }
 
 // helper to create copy constructible lambda from non copy constructible one. std::function<> works only with former kind.
 template<typename Func>
-auto make_copyable_function(Func&& func, std::enable_if_t<!std::is_copy_constructible_v<std::decay_t<Func>>, void*> = nullptr) {
+auto make_copyable_function(Func&& func) {
   auto p = make_lw_shared<typename std::decay_t<Func>>(std::forward<Func>(func));
   return [p] (auto&&... args) { return (*p)( std::forward<decltype(args)>(args)... ); };
 }
 
 template<typename Func>
-auto make_copyable_function(Func&& func, std::enable_if_t<std::is_copy_constructible_v<std::decay_t<Func>>, void*> = nullptr) {
+requires std::copy_constructible<std::decay_t<Func>>
+auto make_copyable_function(Func&& func) {
     return std::forward<Func>(func);
 }
 
@@ -663,12 +788,12 @@ auto protocol<Serializer, MsgType>::make_client(MsgType t) {
 
 template<typename Serializer, typename MsgType>
 template<typename Func>
-auto protocol<Serializer, MsgType>::register_handler(MsgType t, scheduling_group sg, Func&& func) {
+auto protocol<Serializer, MsgType>::do_register_handler(MsgType t, std::optional<scheduling_group> sg, Func&& func) {
     using sig_type = signature<typename function_traits<Func>::signature>;
     using clean_sig_type = typename sig_type::clean;
     using want_client_info = typename sig_type::want_client_info;
     using want_time_point = typename sig_type::want_time_point;
-    auto recv = recv_helper<Serializer>(clean_sig_type(), std::forward<Func>(func),
+    auto recv = recv_helper<Serializer>(static_cast<uint64_t>(t), clean_sig_type(), std::forward<Func>(func),
             want_client_info(), want_time_point());
     register_receiver(t, rpc_handler{sg, make_copyable_function(std::move(recv)), {}});
     return make_client(clean_sig_type(), t);
@@ -676,8 +801,14 @@ auto protocol<Serializer, MsgType>::register_handler(MsgType t, scheduling_group
 
 template<typename Serializer, typename MsgType>
 template<typename Func>
+auto protocol<Serializer, MsgType>::register_handler(MsgType t, scheduling_group sg, Func&& func) {
+    return do_register_handler(t, sg, std::forward<Func>(func));
+}
+
+template<typename Serializer, typename MsgType>
+template<typename Func>
 auto protocol<Serializer, MsgType>::register_handler(MsgType t, Func&& func) {
-    return register_handler(t, scheduling_group(), std::forward<Func>(func));
+    return do_register_handler(t, std::nullopt, std::forward<Func>(func));
 }
 
 template<typename Serializer, typename MsgType>
@@ -701,87 +832,80 @@ bool protocol<Serializer, MsgType>::has_handler(MsgType msg_id) {
 }
 
 template<typename Serializer, typename MsgType>
-rpc_handler* protocol<Serializer, MsgType>::get_handler(uint64_t msg_id) {
-    rpc_handler* h = nullptr;
-    auto it = _handlers.find(MsgType(msg_id));
+std::optional<protocol_base::handler_with_holder> protocol<Serializer, MsgType>::get_handler(uint64_t msg_id) {
+    const auto it = _handlers.find(MsgType(msg_id));
     if (it != _handlers.end()) {
         try {
-            it->second.use_gate.enter();
-            h = &it->second;
+            return handler_with_holder{it->second, it->second.use_gate.hold()};
         } catch (gate_closed_exception&) {
             // unregistered, just ignore
         }
     }
-    return h;
+    return std::nullopt;
 }
 
-template<typename Serializer, typename MsgType>
-void protocol<Serializer, MsgType>::put_handler(rpc_handler* h) {
-    h->use_gate.leave();
+namespace internal {
+
+template<typename Serializer, typename... Out>
+sink_impl<Serializer, Out...>::sink_impl(xshard_connection_ptr con)
+    : sink<Out...>::impl(std::move(con))
+    , _send_queue([this] (snd_buf* buf) { return send_buffer(buf); }, this->_con->get_owner_shard())
+    , _delete_queue([] (snd_buf* buf) { delete buf; return make_ready_future<>(); }, this_shard_id())
+{
+    this->_con->get()->_sink_closed = false;
 }
 
-template<typename T> T make_shard_local_buffer_copy(foreign_ptr<std::unique_ptr<T>> org);
+snd_buf make_shard_local_buffer_copy(snd_buf* org, std::function<deleter(snd_buf*)> make_deleter);
+
+// Runs on connection shard
+template<typename Serializer, typename... Out>
+future<> sink_impl<Serializer, Out...>::send_buffer(snd_buf* data) {
+    auto local_data = make_shard_local_buffer_copy(data, [this] (snd_buf* org) {
+        return deleter(new snd_buf_deleter_impl(org, _delete_queue));
+    });
+    // Exceptions are allowed from here since destroying local_data will free the original data buffer
+    if (this->_ex) {
+        return make_ready_future<>();
+    }
+    connection* con = this->_con->get();
+    // Keep first error in _ex, but make sure to drain the whole batch
+    // and destroy all queued buffers
+    if (con->error()) {
+        this->_ex = std::make_exception_ptr(closed_error());
+        return make_ready_future<>();
+    }
+    if (con->sink_closed()) {
+        this->_ex = std::make_exception_ptr(stream_closed());
+        return make_ready_future<>();
+    }
+
+    return con->send(std::move(local_data), {}, nullptr);
+}
 
 template<typename Serializer, typename... Out>
 future<> sink_impl<Serializer, Out...>::operator()(const Out&... args) {
     // note that we use remote serializer pointer, so if serailizer needs a state
     // it should have per-cpu one
-    snd_buf data = marshall(this->_con->get()->template serializer<Serializer>(), 4, args...);
+    auto data = std::make_unique<snd_buf>(marshall(this->_con->get()->template serializer<Serializer>(), 4, args...));
     static_assert(snd_buf::chunk_size >= 4, "send buffer chunk size is too small");
-    auto p = data.front().get_write();
-    write_le<uint32_t>(p, data.size - 4);
+    auto p = data->front().get_write();
+    write_le<uint32_t>(p, data->size - 4);
     // we do not want to dead lock on huge packets, so let them in
     // but only one at a time
-    auto size = std::min(size_t(data.size), max_stream_buffers_memory);
-    const auto seq_num = _next_seq_num++;
-    return get_units(this->_sem, size).then([this, data = make_foreign(std::make_unique<snd_buf>(std::move(data))), seq_num] (semaphore_units<> su) mutable {
+    auto size = std::min(size_t(data->size), max_stream_buffers_memory);
+    return get_units(this->_sem, size).then([this, data = std::move(data)] (semaphore_units<> su) mutable {
         if (this->_ex) {
             return make_exception_future(this->_ex);
         }
-        // It is OK to discard this future. The user is required to
-        // wait for it when closing.
-        (void)smp::submit_to(this->_con->get_owner_shard(), [this, data = std::move(data), seq_num] () mutable {
-            connection* con = this->_con->get();
-            if (con->error()) {
-                return make_exception_future(closed_error());
-            }
-            if(con->sink_closed()) {
-                return make_exception_future(stream_closed());
-            }
-
-            auto& last_seq_num = _remote_state.last_seq_num;
-            auto& out_of_order_bufs = _remote_state.out_of_order_bufs;
-
-            auto local_data = make_shard_local_buffer_copy(std::move(data));
-            const auto seq_num_diff = seq_num - last_seq_num;
-            if (seq_num_diff > 1) {
-                auto [it, _] = out_of_order_bufs.emplace(seq_num, deferred_snd_buf{promise<>{}, std::move(local_data)});
-                return it->second.pr.get_future();
-            }
-
-            last_seq_num = seq_num;
-            auto ret_fut = con->send(std::move(local_data), {}, nullptr);
-            while (!out_of_order_bufs.empty() && out_of_order_bufs.begin()->first == (last_seq_num + 1)) {
-                auto it = out_of_order_bufs.begin();
-                last_seq_num = it->first;
-                auto fut = con->send(std::move(it->second.data), {}, nullptr);
-                fut.forward_to(std::move(it->second.pr));
-                out_of_order_bufs.erase(it);
-            }
-            return ret_fut;
-        }).then_wrapped([su = std::move(su), this] (future<> f) {
-            if (f.failed() && !this->_ex) { // first error is the interesting one
-                this->_ex = f.get_exception();
-            } else {
-                f.ignore_ready_future();
-            }
-        });
+        data->su = std::move(su);
+        _send_queue.enqueue(data.get());
+        data.release();
         return make_ready_future<>();
     });
 }
 
 template<typename Serializer, typename... Out>
-future<> sink_impl<Serializer, Out...>::flush() {
+future<> sink_impl<Serializer, Out...>::flush() noexcept {
     // wait until everything is sent out before returning.
     return with_semaphore(this->_sem, max_stream_buffers_memory, [this] {
         if (this->_ex) {
@@ -792,24 +916,30 @@ future<> sink_impl<Serializer, Out...>::flush() {
 }
 
 template<typename Serializer, typename... Out>
-future<> sink_impl<Serializer, Out...>::close() {
+future<> sink_impl<Serializer, Out...>::close() noexcept {
     return with_semaphore(this->_sem, max_stream_buffers_memory, [this] {
-        return smp::submit_to(this->_con->get_owner_shard(), [this] {
-            connection* con = this->_con->get();
-            if (con->sink_closed()) { // double close, should not happen!
-                return make_exception_future(stream_closed());
-            }
-            future<> f = make_ready_future<>();
-            if (!con->error() && !this->_ex) {
-                snd_buf data = marshall(con->template serializer<Serializer>(), 4);
-                static_assert(snd_buf::chunk_size >= 4, "send buffer chunk size is too small");
-                auto p = data.front().get_write();
-                write_le<uint32_t>(p, -1U); // max len fragment marks an end of a stream
-                f = con->send(std::move(data), {}, nullptr);
-            } else {
-                f = this->_ex ? make_exception_future(this->_ex) : make_exception_future(closed_error());
-            }
-            return f.finally([con] { return con->close_sink(); });
+        // break the semaphore to prevent any new messages to be sent
+        this->_sem.broken(stream_closed());
+        return _send_queue.stop().finally([this] {
+            return smp::submit_to(this->_con->get_owner_shard(), [this] {
+                return _delete_queue.stop().finally([this] {
+                    connection* con = this->_con->get();
+                    if (con->sink_closed()) { // double close, should not happen!
+                        return make_exception_future(stream_closed());
+                    }
+                    future<> f = make_ready_future<>();
+                    if (!con->error() && !this->_ex) {
+                        snd_buf data = marshall(con->template serializer<Serializer>(), 4);
+                        static_assert(snd_buf::chunk_size >= 4, "send buffer chunk size is too small");
+                        auto p = data.front().get_write();
+                        write_le<uint32_t>(p, -1U); // max len fragment marks an end of a stream
+                        f = con->send(std::move(data), {}, nullptr);
+                    } else {
+                        f = this->_ex ? make_exception_future(this->_ex) : make_exception_future(closed_error());
+                    }
+                    return f.finally([con] { return con->close_sink(); });
+                });
+            });
         });
     });
 }
@@ -818,8 +948,10 @@ template<typename Serializer, typename... Out>
 sink_impl<Serializer, Out...>::~sink_impl() {
     // A failure to close might leave some continuations running after
     // this is destroyed, leading to use-after-free bugs.
-    assert(this->_con->get()->sink_closed());
+    SEASTAR_ASSERT(this->_con->get()->sink_closed());
 }
+
+rcv_buf make_shard_local_buffer_copy(foreign_ptr<std::unique_ptr<rcv_buf>> org);
 
 template<typename Serializer, typename... In>
 future<std::optional<std::tuple<In...>>> source_impl<Serializer, In...>::operator()() {
@@ -866,6 +998,8 @@ future<std::optional<std::tuple<In...>>> source_impl<Serializer, In...>::operato
     });
 }
 
+} // namespace internal
+
 template<typename... Out>
 connection_id sink<Out...>::get_id() const {
     return _impl->_con->get()->get_connection_id();
@@ -879,7 +1013,7 @@ connection_id source<In...>::get_id() const {
 template<typename... In>
 template<typename Serializer, typename... Out>
 sink<Out...> source<In...>::make_sink() {
-    return sink<Out...>(make_shared<sink_impl<Serializer, Out...>>(_impl->_con));
+    return sink<Out...>(make_shared<internal::sink_impl<Serializer, Out...>>(_impl->_con));
 }
 
 }
@@ -896,5 +1030,3 @@ struct hash<seastar::rpc::streaming_domain_type> {
     }
 };
 }
-
-

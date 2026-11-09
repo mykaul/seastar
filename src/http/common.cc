@@ -19,20 +19,14 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
-#include <cstdlib>
 #include <memory>
 #include <utility>
+#include <numeric>
+#include <span>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/http/common.hh>
 #include <seastar/core/iostream-impl.hh>
-#endif
 
 namespace seastar {
 
@@ -60,6 +54,9 @@ operation_type str2type(const sstring& type) {
     if (type == "CONNECT") {
         return CONNECT;
     }
+    if (type == "PATCH") {
+        return PATCH;
+    }
     return GET;
 }
 
@@ -84,6 +81,9 @@ sstring type2str(operation_type type) {
     }
     if (type == CONNECT) {
         return "CONNECT";
+    }
+    if (type == PATCH) {
+        return "PATCH";
     }
     return "GET";
 }
@@ -113,9 +113,41 @@ class http_chunked_data_sink_impl : public data_sink_impl {
 public:
     http_chunked_data_sink_impl(output_stream<char>& out) : _out(out) {
     }
-    virtual future<> put(net::packet data)  override { abort(); }
+#if SEASTAR_API_LEVEL >= 9
+    future<> put(std::span<temporary_buffer<char>> data) override {
+        size_t size = std::accumulate(data.begin(), data.end(), size_t(0),
+                [] (size_t s, const auto& b) { return s + b.size(); });
+        if (size == 0) {
+            // size 0 chunk should be ignored, some server
+            // may consider it an end of message
+            return make_ready_future<>();
+        }
+        // The span is only valid synchronously, so move the buffers into
+        // an owning vector before any suspension. The chunk size header and
+        // trailing CRLF go through small buffered writes, while the user's
+        // payload is forwarded as a span over the owned vector so the
+        // underlying output_stream can splice it into its zero-copy queue
+        // without copying user data.
+        auto buffers = std::vector<temporary_buffer<char>>(
+                std::make_move_iterator(data.begin()),
+                std::make_move_iterator(data.end()));
+        return write_size(size).then([this, buffers = std::move(buffers)] () mutable {
+            return _out.write(std::span<temporary_buffer<char>>(buffers));
+        }).then([this] {
+            return _out.write("\r\n", 2);
+        });
+    }
+#else
+    virtual future<> put(net::packet data) override {
+        return data_sink_impl::fallback_put(std::move(data));
+    }
     using data_sink_impl::put;
     virtual future<> put(temporary_buffer<char> buf) override {
+        return do_put(std::move(buf));
+    }
+#endif
+private:
+    future<> do_put(temporary_buffer<char> buf) {
         if (buf.size() == 0) {
             // size 0 buffer should be ignored, some server
             // may consider it an end of message
@@ -160,22 +192,48 @@ public:
         // at the very beginning, 0 bytes were written
         _bytes_written = 0;
     }
-    virtual future<> put(net::packet data)  override { abort(); }
+#if SEASTAR_API_LEVEL >= 9
+    future<> put(std::span<temporary_buffer<char>> data) override {
+        size_t size = std::accumulate(data.begin(), data.end(), size_t(0), [] (size_t s, const auto& b) { return s + b.size(); });
+        if (size == 0) {
+            return make_ready_future<>();
+        }
+        if (_bytes_written + size > _limit) {
+            return make_exception_future<>(std::runtime_error(format("body content length overflow: want {} limit {}", _bytes_written + size, _limit)));
+        }
+        return _out.write(data).then([this, size] {
+            _bytes_written += size;
+        });
+    }
+#else
+    virtual future<> put(net::packet data) override {
+        auto size = data.len();
+        if (size == 0) {
+            return make_ready_future<>();
+        }
+        if (_bytes_written + size > _limit) {
+            return make_exception_future<>(std::runtime_error(format("body content length overflow: want {} limit {}", _bytes_written + size, _limit)));
+        }
+        return _out.write(std::move(data)).then([this, size] {
+            _bytes_written += size;
+        });
+    }
     using data_sink_impl::put;
     virtual future<> put(temporary_buffer<char> buf) override {
-        if (buf.size() == 0 || _bytes_written == _limit) {
+        auto size = buf.size();
+        if (size == 0) {
             return make_ready_future<>();
         }
 
-        auto size = buf.size();
         if (_bytes_written + size > _limit) {
-            return make_exception_future<>(std::runtime_error(format("body conent length overflow: want {} limit {}", _bytes_written + buf.size(), _limit)));
+            return make_exception_future<>(std::runtime_error(format("body content length overflow: want {} limit {}", _bytes_written + buf.size(), _limit)));
         }
 
         return _out.write(buf.get(), size).then([this, size] {
             _bytes_written += size;
         });
     }
+#endif
     virtual future<> close() override {
         return make_ready_future<>();
     }

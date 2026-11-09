@@ -22,7 +22,7 @@
 #include <iostream>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/reactor.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/units.hh>
 
@@ -37,7 +37,7 @@ static int tx_msg_nr = tx_msg_total_size / tx_msg_size;
 static std::string str_txbuf(tx_msg_size, 'X');
 
 class client;
-distributed<client> clients;
+sharded<client> clients;
 
 transport protocol = transport::TCP;
 
@@ -205,7 +205,7 @@ public:
 
     future<> start(ipv4_addr server_addr, std::string test, unsigned ncon) {
         _server_addr = server_addr;
-        _concurrent_connections = ncon * smp::count;
+        _concurrent_connections = ncon * this_smp_shard_count();
         _total_pings = _pings_per_connection * _concurrent_connections;
         _test = test;
 

@@ -19,41 +19,29 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <memory>
 #include <algorithm>
-#include <bitset>
-#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <functional>
-#include <iostream>
-#include <limits>
-#include <queue>
-#include <unordered_map>
 #include <vector>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/sstring.hh>
-#include <seastar/core/app-template.hh>
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/metrics.hh>
-#include <seastar/core/print.hh>
+#include <ranges>
+
 #include <seastar/http/httpd.hh>
 #include <seastar/http/internal/content_source.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/string_utils.hh>
-#endif
+#include <seastar/coroutine/switch_to.hh>
 
 
 using namespace std::chrono_literals;
@@ -74,7 +62,8 @@ http_stats::http_stats(http_server& server, const sstring& name)
             sm::make_gauge("connections_current", [&server] { return server.current_connections(); }, sm::description("The current number of open  connections"), labels),
             sm::make_counter("read_errors", [&server] { return server.read_errors(); }, sm::description("The total number of errors while reading http requests"), labels),
             sm::make_counter("reply_errors", [&server] { return server.reply_errors(); }, sm::description("The total number of errors while replying to http"), labels),
-            sm::make_counter("requests_served", [&server] { return server.requests_served(); }, sm::description("The total number of http requests served"), labels)
+            sm::make_counter("requests_served", [&server] { return server.requests_served(); }, sm::description("The total number of http requests served"), labels),
+            sm::make_counter("tls_handshake_errors", [&server] { return server.tls_handshake_errors(); }, sm::description("The total number of TLS handshake failures"), labels)
     });
 }
 
@@ -98,57 +87,39 @@ future<> connection::do_response_loop() {
 }
 
 future<> connection::start_response() {
-    if (_resp->_body_writer) {
-        return _resp->write_reply_to_connection(*this).then_wrapped([this] (auto f) {
-            if (f.failed()) {
-                // In case of an error during the write close the connection
-                _server._respond_errors++;
-                _done = true;
-                _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
-                _replies.push(std::unique_ptr<http::reply>());
-                f.ignore_ready_future();
-                return make_ready_future<>();
-            }
-            return _write_buf.write("0\r\n\r\n", 5);
-        }).then_wrapped([this ] (auto f) {
-            if (f.failed()) {
-                // We could not write the closing sequence
-                // Something is probably wrong with the connection,
-                // we should close it, so the client will disconnect
-                _done = true;
-                _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
-                _replies.push(std::unique_ptr<http::reply>());
-                f.ignore_ready_future();
-                return make_ready_future<>();
-            } else {
-                return _write_buf.flush();
-            }
-        }).then_wrapped([this] (auto f) {
-            if (f.failed()) {
-                // flush failed. just close the connection
-                _done = true;
-                _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
-                _replies.push(std::unique_ptr<http::reply>());
-                f.ignore_ready_future();
-            }
-            _resp.reset();
+    return _resp->write_reply(out()).then_wrapped([this] (auto f) {
+        if (f.failed()) {
+            // In case of an error during the write close the connection
+            _server._respond_errors++;
+            _done = true;
+            _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
+            _replies.push(std::unique_ptr<http::reply>());
+            f.ignore_ready_future();
+        }
+        return make_ready_future<>();
+    }).then_wrapped([this ] (auto f) {
+        if (f.failed()) {
+            // We could not write the closing sequence
+            // Something is probably wrong with the connection,
+            // we should close it, so the client will disconnect
+            _done = true;
+            _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
+            _replies.push(std::unique_ptr<http::reply>());
+            f.ignore_ready_future();
             return make_ready_future<>();
-        });
-    }
-    set_headers(*_resp);
-    _resp->_headers["Content-Length"] = to_sstring(
-            _resp->_content.size());
-    return _write_buf.write(_resp->_response_line.data(),
-            _resp->_response_line.size()).then([this] {
-        return _resp->write_reply_headers(*this);
-    }).then([this] {
-        return _write_buf.write("\r\n", 2);
-    }).then([this] {
-        return write_body();
-    }).then([this] {
-        return _write_buf.flush();
-    }).then([this] {
+        } else {
+            return _write_buf.flush();
+        }
+    }).then_wrapped([this] (auto f) {
+        if (f.failed()) {
+            // flush failed. just close the connection
+            _done = true;
+            _replies.abort(std::make_exception_ptr(std::logic_error("Unknown exception during body creation")));
+            _replies.push(std::unique_ptr<http::reply>());
+            f.ignore_ready_future();
+        }
         _resp.reset();
+        return make_ready_future<>();
     });
 }
 
@@ -166,7 +137,9 @@ void connection::on_new_connection() {
 
 future<> connection::read() {
     return do_until([this] {return _done;}, [this] {
-        return read_one();
+        // A request that ended before it was read in full - a malformed one, or one
+        // whose read failed - is no longer being read either.
+        return read_one().finally([this] { _reading_request = false; });
     }).then_wrapped([this] (future<> f) {
         // swallow error
         if (f.failed()) {
@@ -180,6 +153,7 @@ future<> connection::read() {
 static input_stream<char> make_content_stream(http::request* req, input_stream<char>& buf) {
     // Create an input stream based on the requests body encoding or lack thereof
     if (seastar::internal::case_insensitive_cmp()(req->get_header("Transfer-Encoding"), "chunked")) {
+        req->content_length = 0;
         return input_stream<char>(data_source(std::make_unique<internal::chunked_source_impl>(buf, req->chunk_extensions, req->trailing_headers)));
     } else {
         return input_stream<char>(data_source(std::make_unique<internal::content_length_source_impl>(buf, req->content_length)));
@@ -195,9 +169,21 @@ set_request_content(std::unique_ptr<http::request> req, input_stream<char>* cont
     } else {
         // Read the entire content into the request content string
         return util::read_entire_stream_contiguous(*content_stream).then([req = std::move(req)] (sstring content) mutable {
-            req->content = std::move(content);
+            http::internal::deprecated_content(*req) = std::move(content);
             return make_ready_future<std::unique_ptr<http::request>>(std::move(req));
         });
+    }
+}
+
+static void set_header_connection(http::reply& resp, bool keep_alive) {
+    if (keep_alive) {
+        if (resp._version == "1.0") {
+            resp.add_header("Connection", "Keep-Alive");
+        }
+    } else {
+        if (resp._version == "1.1") {
+            resp.add_header("Connection", "close");
+        }
     }
 }
 
@@ -206,14 +192,22 @@ void connection::generate_error_reply_and_close(std::unique_ptr<http::request> r
     // TODO: Handle HTTP/2.0 when it releases
     resp->set_version(req->_version);
     resp->set_status(status, msg);
-    resp->done();
+    set_header_connection(*resp, false);
     _done = true;
     _replies.push(std::move(resp));
 }
 
 future<> connection::read_one() {
     _parser.init();
-    return _read_buf.consume(_parser).then([this] () mutable {
+    _parser.set_size_limit(_server.get_request_size_limit());
+    return _read_buf.consume([this] (temporary_buffer<char> buf) {
+        // A request is being read from its first byte, rather than from when its
+        // headers have been parsed: a client may be partway through sending them.
+        if (!buf.empty()) {
+            _reading_request = true;
+        }
+        return _parser(std::move(buf));
+    }).then([this] () mutable {
         if (_parser.eof()) {
             _done = true;
             return make_ready_future<>();
@@ -226,13 +220,27 @@ future<> connection::read_one() {
 
         if (_tls) {
             req->protocol_name = "https";
+            req->tls_dn = _tls_dn ? &*_tls_dn : nullptr;
+            req->tls_san = _tls_san ? &*_tls_san : nullptr;
         }
         if (_parser.failed()) {
             if (req->_version.empty()) {
                 // we might have failed to parse even the version
                 req->_version = "1.1";
             }
+            if (_parser.size_limit_exceeded()) {
+                auto status = _parser.uri_too_large()
+                        ? http::reply::status_type::uri_too_long
+                        : http::reply::status_type::request_header_fields_too_large;
+                generate_error_reply_and_close(std::move(req), status, "Request line or headers too large");
+                return make_ready_future<>();
+            }
             generate_error_reply_and_close(std::move(req), http::reply::status_type::bad_request, "Can't parse the request");
+            return make_ready_future<>();
+        }
+
+        if (req->_headers.contains("Transfer-Encoding") && req->_headers.contains("Content-Length")) {
+            generate_error_reply_and_close(std::move(req), http::reply::status_type::bad_request, "Conflicting Transfer-Encoding and Content-Length headers");
             return make_ready_future<>();
         }
 
@@ -259,7 +267,7 @@ future<> connection::read_one() {
                     auto continue_reply = std::make_unique<http::reply>();
                     set_headers(*continue_reply);
                     continue_reply->set_version(req->_version);
-                    continue_reply->set_status(http::reply::status_type::continue_).done();
+                    continue_reply->set_status(http::reply::status_type::continue_);
                     this->_replies.push(std::move(continue_reply));
                     return make_ready_future<std::unique_ptr<http::request>>(std::move(req));
                 });
@@ -270,20 +278,42 @@ future<> connection::read_one() {
 
         return maybe_reply_continue().then([this] (std::unique_ptr<http::request> req) {
             return do_with(make_content_stream(req.get(), _read_buf), sstring(req->_version), std::move(req), [this] (input_stream<char>& content_stream, sstring& version, std::unique_ptr<http::request>& req) {
-                return set_request_content(std::move(req), &content_stream, _server.get_content_streaming()).then([this, &content_stream] (std::unique_ptr<http::request> req) {
+                bool streaming = _server.get_content_streaming();
+                return set_request_content(std::move(req), &content_stream, streaming).then([this, &content_stream, streaming] (std::unique_ptr<http::request> req) {
+                    if (!streaming) {
+                        // The body was read before the handler was called.
+                        request_read();
+                    }
                     return _replies.not_full().then([this, req = std::move(req)] () mutable {
                         return generate_reply(std::move(req));
                     }).then([this, &content_stream](bool done) {
-                        _done = done;
+                        // Or-ed rather than assigned: stop_reading() may have set it
+                        // while this request was in flight, and a keep-alive request
+                        // reports false, which would put the connection back to waiting
+                        // for another one - and leave whoever is draining it waiting too.
+                        _done = _done || done;
                         // If the handler did not read the entire request
                         // content, this connection cannot be reused so we
                         // need to close it (via "_done = true"). But we can't
                         // just check content_stream.eof(): It may only become
                         // true after read(). Issue #907.
-                        return content_stream.read().then([this] (temporary_buffer<char> buf) {
-                            if (!buf.empty()) {
+                        //
+                        // That read can now fail rather than answer: a body that
+                        // ended early raises. The reply is already generated and the
+                        // peer that would receive an error is the one that went away,
+                        // so only the connection is left to decide, and it is done.
+                        return content_stream.read().then_wrapped([this] (future<temporary_buffer<char>> f) {
+                            if (f.failed()) {
+                                f.ignore_ready_future();
+                                _done = true;
+                                return;
+                            }
+                            if (!f.get().empty()) {
                                 _done = true;
                             }
+                            // The handler streamed the body, and has returned: whatever
+                            // it left unread will not be read.
+                            request_read();
                         });
                     });
                 }).handle_exception_type([this, &version] (const base_exception& e) mutable {
@@ -305,23 +335,67 @@ future<> connection::process() {
         try {
             std::get<0>(joined).get();
         } catch (...) {
-            hlogger.debug("Read exception encountered: {}", std::current_exception());
+            hlogger.debug("Read exception encountered: {}", seastar::formattable(std::current_exception()));
         }
         try {
             std::get<1>(joined).get();
         } catch (...) {
-            hlogger.debug("Response exception encountered: {}", std::current_exception());
+            hlogger.debug("Response exception encountered: {}", seastar::formattable(std::current_exception()));
         }
         return make_ready_future<>();
     }).finally([this]{
         return _read_buf.close().handle_exception([](std::exception_ptr e) {
-            hlogger.debug("Close exception encountered: {}", e);
+            hlogger.debug("Close exception encountered: {}", seastar::formattable(e));
         });
     });
 }
+
+future<> connection::prepare() {
+    if (_tls) {
+        // Wait for the TLS handshake to complete, if it hasn't already, and
+        // then also retrieve the client certificate's Subject Distinguished
+        // Name (DN) and Subject Alternative Name (SAN).
+        // These are stored in the connection (_tls_dn and _tls_san) and
+        // referenced in every request so that request handlers can perform
+        // certificate-based authentication.
+        // Note: these are fetched once and cached for the lifetime of the
+        // connection. TLS 1.2 allows mid-connection renegotiation, which can
+        // change the client certificate; in that case the cached DN/SAN will
+        // not be updated. TLS 1.3 does not support renegotiation, so this is
+        // not an issue there.
+        _tls_dn = co_await tls::get_dn_information(_fd);
+        _tls_san = co_await tls::get_alt_name_information(_fd);
+    }
+}
+
 void connection::shutdown() {
     _fd.shutdown_input();
     _fd.shutdown_output();
+}
+
+void connection::stop_reading() {
+    // Ends the keep-alive loop once the request in flight, if any, has been answered.
+    _done = true;
+    _stop_reading = true;
+    if (_reading_request) {
+        // A request is still arriving. Shutting input down now would fail the read of
+        // it, which is the opposite of draining it: request_read() does that once it
+        // has been read in full.
+        return;
+    }
+    // Idle between requests, which means it is parked in read() and would stay there
+    // until its client sent something or gave up. Wake it.
+    _fd.shutdown_input();
+}
+
+void connection::request_read() {
+    if (!std::exchange(_reading_request, false)) {
+        return;
+    }
+    if (_stop_reading) {
+        // Draining, and this was the last request this connection will read.
+        _fd.shutdown_input();
+    }
 }
 
 output_stream<char>& connection::out() {
@@ -339,14 +413,13 @@ future<> connection::respond() {
     });
 }
 
-future<> connection::write_body() {
-    return _write_buf.write(_resp->_content.data(),
-            _resp->_content.size());
-}
-
 void connection::set_headers(http::reply& resp) {
-    resp._headers["Server"] = "Seastar httpd";
-    resp._headers["Date"] = _server._date;
+    if (_server._server_header.has_value()) {
+        resp._headers["Server"] = *_server._server_header;
+    }
+    if (_server._generate_date_header) {
+        resp._headers["Date"] = _server._date;
+    }
 }
 
 future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
@@ -354,23 +427,20 @@ future<bool> connection::generate_reply(std::unique_ptr<http::request> req) {
     resp->set_version(req->_version);
     set_headers(*resp);
     bool keep_alive = req->should_keep_alive();
-    if (keep_alive && req->_version == "1.0") {
-        resp->_headers["Connection"] = "Keep-Alive";
-    }
+    set_header_connection(*resp, keep_alive);
 
     sstring url = req->parse_query_param();
     sstring version = req->_version;
+    if (req->_method == "HEAD") {
+        resp->skip_body();
+    }
     return _server._routes.handle(url, std::move(req), std::move(resp)).
     // Caller guarantees enough room
     then([this, keep_alive , version = std::move(version)](std::unique_ptr<http::reply> rep) {
-        rep->set_version(version).done();
+        rep->set_version(version);
         this->_replies.push(std::move(rep));
         return make_ready_future<bool>(!keep_alive);
     });
-}
-
-void http_server::set_tls_credentials(server_credentials_ptr credentials) {
-    _credentials = credentials;
 }
 
 size_t http_server::get_content_length_limit() const {
@@ -381,6 +451,14 @@ void http_server::set_content_length_limit(size_t limit) {
     _content_length_limit = limit;
 }
 
+size_t http_server::get_request_size_limit() const {
+    return _request_size_limit;
+}
+
+void http_server::set_request_size_limit(size_t limit) {
+    _request_size_limit = limit;
+}
+
 bool http_server::get_content_streaming() const {
     return _content_streaming;
 }
@@ -389,14 +467,192 @@ void http_server::set_content_streaming(bool b) {
     _content_streaming = b;
 }
 
-future<> http_server::listen(socket_address addr, listen_options lo, 
-            server_credentials_ptr listener_credentials) {
-    if (listener_credentials) {
-        _listeners.push_back(seastar::tls::listen(listener_credentials, addr, lo));
-    } else {
-        _listeners.push_back(seastar::listen(addr, lo));
+const std::optional<sstring>& http_server::get_server_header() const {
+    return _server_header;
+}
+
+void http_server::set_server_header(std::optional<sstring> value) {
+    _server_header = std::move(value);
+}
+
+bool http_server::get_generate_date_header() const {
+    return _generate_date_header;
+}
+
+void http_server::set_generate_date_header(bool b) {
+    if (b == _generate_date_header) {
+        return;
     }
-    return do_accepts(_listeners.size() - 1, listener_credentials != nullptr);
+    _generate_date_header = b;
+    if (b) {
+        _date = http_date();
+        _date_format_timer.arm_periodic(1s);
+    } else {
+        _date_format_timer.cancel();
+    }
+}
+
+void http_server::set_request_scheduling_group(scheduling_group sg) {
+    _request_scheduling_group = sg;
+}
+
+future<> http_server::listen(socket_address addr, listen_options lo,
+            server_credentials_ptr listener_credentials) {
+    try {
+        return listen(bind_listening_socket(addr, lo, listener_credentials),
+                listener_credentials != nullptr);
+    } catch (...) {
+        return current_exception_as_future<>();
+    }
+}
+
+listener_entry& http_server::add_listener(server_socket&& ss, bool tls) {
+    // The address actually bound, rather than the one asked for: a listener asked for
+    // port 0 is known by the port it was given.
+    auto bound = ss.local_address();
+    // Bound, but not accepting: that starts when somebody serves it.
+    return _listeners.emplace_back(std::move(ss), bound, tls, _next_listener_index++);
+}
+
+server_socket http_server::bind_listening_socket(socket_address addr, listen_options lo,
+        server_credentials_ptr credentials) {
+    return credentials ? seastar::tls::listen(credentials, addr, lo) : seastar::listen(addr, lo);
+}
+
+future<listener> http_server::bind(socket_address addr, listen_options lo,
+        server_credentials_ptr credentials) {
+    try {
+        return bind(bind_listening_socket(addr, lo, credentials), credentials != nullptr);
+    } catch (...) {
+        return current_exception_as_future<listener>();
+    }
+}
+
+future<listener> http_server::bind(server_socket&& ss, bool tls) {
+    return make_ready_future<listener>(listener(*this, add_listener(std::move(ss), tls)));
+}
+
+void http_server::drop_listener(listener_entry& listener) {
+    // Nothing has been accepted on it, so there is nothing to drain and nothing holding a
+    // reference: giving the address up is closing the socket.
+    _listeners.remove_if([&listener] (const listener_entry& e) { return &e == &listener; });
+}
+
+socket_address listeners_compat_view::entry::local_address() const noexcept {
+    return _entry->addr;
+}
+
+size_t listeners_compat_view::size() const noexcept {
+    return _server->_listeners.size();
+}
+
+bool listeners_compat_view::empty() const noexcept {
+    return _server->_listeners.empty();
+}
+
+listeners_compat_view::entry listeners_compat_view::at(size_t i) const {
+    if (i >= size()) {
+        throw std::out_of_range(seastar::format("no listener {}", i));
+    }
+    return entry(*std::next(_server->_listeners.begin(), i));
+}
+
+listeners_compat_view::entry listeners_compat_view::operator[](size_t i) const {
+    return at(i);
+}
+
+listeners_compat_view::entry listeners_compat_view::front() const {
+    return at(0);
+}
+
+listeners_compat_view::entry listeners_compat_view::back() const {
+    return at(size() - 1);
+}
+
+void listeners_compat_view::push_back(server_socket&& ss) {
+    _server->add_listener(std::move(ss), false);
+}
+
+void listeners_compat_view::emplace_back(server_socket&& ss) {
+    push_back(std::move(ss));
+}
+
+listener& listener::operator=(listener&& other) noexcept {
+    if (this != &other) {
+        // Release what this one holds rather than destroying it: calling the destructor
+        // would end its lifetime, and the assignments below would then be writing to an
+        // object that no longer exists.
+        if (_entry) {
+            _server->drop_listener(*_entry);
+        }
+        _server = std::exchange(other._server, nullptr);
+        _entry = std::exchange(other._entry, nullptr);
+    }
+    return *this;
+}
+
+listener::~listener() {
+    if (_entry) {
+        _server->drop_listener(*_entry);
+    }
+}
+
+socket_address listener::address() const noexcept {
+    return _entry->addr;
+}
+
+future<> listener::serve(abort_source& as) {
+    auto& entry = *std::exchange(_entry, nullptr);
+    auto& server = *std::exchange(_server, nullptr);
+    server.start_accepting(entry, entry.tls);
+    return server.serve_until_aborted(entry, as);
+}
+
+future<> http_server::serve_until_aborted(listener_entry& listener, abort_source& as) {
+    // Taken before anything can resolve it. Waiting on this rather than on the removal
+    // itself is what lets stopping the whole server finish this future too.
+    auto removed = listener.removed.get_shared_future();
+
+    auto subscription = as.subscribe([this, &listener] () noexcept {
+        // Fire and forget: what the caller waits on is `removed`, which the removal
+        // resolves. Held by the server's task gate so that it cannot outlive the server.
+        (void)try_with_gate(_task_gate, [this, &listener] {
+            return remove_listener(listener);
+        }).handle_exception([] (std::exception_ptr) {});
+    });
+    if (!subscription) {
+        // Already aborted before we got here.
+        co_await remove_listener(listener);
+    }
+    co_await std::move(removed);
+}
+
+future<> http_server::remove_listener(listener_entry& listener) {
+    if (listener.connections_gate.is_closed()) {
+        // Already being removed, or the whole server is stopping and will see to it.
+        co_return;
+    }
+    auto drained = stop_accepting(listener);
+    co_await std::move(listener.accept_loop);
+    co_await drain_connections_of(listener, std::move(drained));
+    report_removed(listener);
+    // The entry outlives this only as far as the iterator: nothing holds a reference to
+    // it any more, since the accept loop has finished and its connections are gone.
+    _listeners.remove_if([&listener] (const listener_entry& e) { return &e == &listener; });
+}
+
+future<> http_server::stop_accepting(listener_entry& listener) {
+    // The gate closes before the abort, so that the accept loop reads the abort as being
+    // asked to stop rather than as a failure to log and carry on from. A connection the
+    // loop accepts in between cannot hold the closed gate, and is turned away.
+    auto drained = listener.connections_gate.close();
+    listener.socket.abort_accept();
+    return drained;
+}
+
+listener_entry* http_server::listener_at(int which) {
+    auto it = std::ranges::find(_listeners, size_t(which), &listener_entry::index);
+    return it == _listeners.end() ? nullptr : &*it;
 }
 
 future<> http_server::listen(socket_address addr, listen_options lo) {
@@ -415,26 +671,121 @@ future<> http_server::listen(socket_address addr) {
     lo.reuse_address = true;
     return listen(addr, lo);
 }
+
+future<> http_server::listen(server_socket&& ss, bool tls) {
+    // A listener that lives until the server stops is one served against the server's
+    // own abort_source, so there is one way a listener ends rather than two. Its end of
+    // that is kept for stop() to wait on.
+    return bind(std::move(ss), tls).then([this] (listener l) {
+        _listening.push_back(l.serve(_stop));
+    });
+}
+
+// How long removing a listener waits for its connections to finish by themselves.
+static constexpr auto listener_drain_timeout = std::chrono::seconds(5);
+
+future<> http_server::drain_connections_of(listener_entry& listener, future<> drained) {
+    for (auto&& conn : _connections) {
+        if (conn._listener == &listener) {
+            conn.stop_reading();
+        }
+    }
+    // A client that stops sending halfway through a request would otherwise keep its
+    // connection - and so this drain - open for as long as it cares to. Past the
+    // deadline, whatever is left is cut off rather than waited for.
+    timer<> deadline([this, &listener] {
+        for (auto&& conn : _connections) {
+            if (conn._listener == &listener) {
+                conn.shutdown();
+            }
+        }
+    });
+    deadline.arm(listener_drain_timeout);
+    // Every connection accepted on this listener holds its gate, so the gate's close
+    // resolving is exactly "once the last of them has finished".
+    co_await std::move(drained);
+}
+
+std::vector<socket_address> http_server::listening_addresses() const {
+    return _listeners | std::views::transform(&listener_entry::addr) | std::ranges::to<std::vector>();
+}
+
 future<> http_server::stop() {
     future<> tasks_done = _task_gate.close();
-    for (auto&& l : _listeners) {
-        l.abort_accept();
-    }
+    // A listener whose gate is already closed is being removed, and that removal is
+    // held by the task gate.
+    auto drained = _listeners
+            | std::views::filter([] (const listener_entry& l) { return !l.connections_gate.is_closed(); })
+            | std::views::transform([this] (listener_entry& l) { return stop_accepting(l); })
+            | std::ranges::to<std::vector>();
     for (auto&& c : _connections) {
         c.shutdown();
     }
-    return tasks_done;
+    co_await std::move(tasks_done);
+    // Connections hold the task gate too, so these have drained already.
+    co_await when_all(drained.begin(), drained.end()).discard_result();
+    // Every listener has stopped and its connections are gone, so the listeners that
+    // listen() created can end now. The entries themselves are kept rather than erased:
+    // a serve() that has not woken up yet holds a reference to its own, and a stopped
+    // server never serves again.
+    _stop.request_abort();
+    for (auto&& l : _listeners) {
+        report_removed(l);
+    }
+    co_await when_all(_listening.begin(), _listening.end()).discard_result();
 }
 
-// FIXME: This could return void
+void http_server::report_removed(listener_entry& listener) {
+    if (std::exchange(listener.removal_reported, true)) {
+        return;
+    }
+    listener.removed.set_value();
+}
+
+// This is a named class member coroutine, so that 'this', 'which' and 'tls'
+// live safely in the coroutine frame, therefore `accept_loop()` can safely suspend
+// at `co_await do_accept_one()`.
+future<> http_server::run_accept_loop(listener_entry& listener, bool tls) {
+    while (!_task_gate.is_closed() && !listener.connections_gate.is_closed()) {
+        try {
+            co_await do_accept_one(listener, tls);
+        } catch (const gate_closed_exception&) {
+            co_return;
+        } catch (const std::system_error& e) {
+            if (listener.connections_gate.is_closed()) {
+                // The abort that removing this listener asked for, rather than a failure.
+                co_return;
+            }
+            // We expect a ECONNABORTED when http_server::stop is called,
+            // no point in warning about that.
+            if (e.code().value() != ECONNABORTED) {
+                hlogger.error("accept failed: {}", e);
+            }
+        } catch (...) {
+            if (listener.connections_gate.is_closed()) {
+                co_return;
+            }
+            hlogger.error("accept failed: {}", seastar::formattable(std::current_exception()));
+        }
+    }
+}
+
+void http_server::start_accepting(listener_entry& listener, bool tls) {
+    // Kept rather than detached, so that this listener's loop can be waited for on its
+    // own rather than through the server's task gate.
+    listener.accept_loop = try_with_gate(_task_gate, [this, &listener, tls] {
+        return run_accept_loop(listener, tls);
+    }).handle_exception_type([addr = listener.addr] (const gate_closed_exception& e) {
+        hlogger.warn("In http_server::start_accepting({}): {}", addr, e.what());
+    });
+}
+
 future<> http_server::do_accepts(int which, bool tls) {
-    (void)try_with_gate(_task_gate, [this, which, tls] {
-        return keep_doing([this, which, tls] {
-            return try_with_gate(_task_gate, [this, which, tls] {
-                return do_accept_one(which, tls);
-            });
-        }).handle_exception_type([](const gate_closed_exception& e) {});
-    }).handle_exception_type([](const gate_closed_exception& e) {});
+    auto* listener = listener_at(which);
+    if (!listener) {
+        return make_exception_future<>(std::out_of_range(seastar::format("no listener {}", which)));
+    }
+    start_accepting(*listener, tls);
     return make_ready_future<>();
 }
 
@@ -442,25 +793,61 @@ future<> http_server::do_accepts(int which){
     return do_accepts(which, _credentials != nullptr);
 }
 
-future<> http_server::do_accept_one(int which, bool tls) {
-    return _listeners[which].accept().then([this, tls] (accept_result ar) mutable {
-        auto local_address = ar.connection.local_address();
-        auto conn = std::make_unique<connection>(*this, std::move(ar.connection),
-                std::move(ar.remote_address), std::move(local_address), tls);
-        (void)try_with_gate(_task_gate, [conn = std::move(conn)]() mutable {
-            return conn->process().handle_exception([conn = std::move(conn)] (std::exception_ptr ex) {
-                hlogger.error("request error: {}", ex);
-            });
-        }).handle_exception_type([] (const gate_closed_exception& e) {});
-    }).handle_exception_type([] (const std::system_error &e) {
-        // We expect a ECONNABORTED when http_server::stop is called,
-        // no point in warning about that.
-        if (e.code().value() != ECONNABORTED) {
-            hlogger.error("accept failed: {}", e);
-        }
-    }).handle_exception([] (std::exception_ptr ex) {
-        hlogger.error("accept failed: {}", ex);
-    });
+future<> http_server::accept_loop(int which, bool tls) {
+    auto* listener = listener_at(which);
+    if (!listener) {
+        return make_exception_future<>(std::out_of_range(seastar::format("no listener {}", which)));
+    }
+    return run_accept_loop(*listener, tls);
+}
+
+future<> http_server::do_accept_one(listener_entry& listener, bool tls) {
+    auto ar = co_await listener.socket.accept();
+    if (_keepalive_params) {
+        ar.connection.set_keepalive(true);
+        ar.connection.set_keepalive_parameters(_keepalive_params.value());
+    }
+    // The lambda passed to try_with_gate must not be a coroutine,
+    // because try_with_gate invokes it but does not store it: a coroutine
+    // lambda would be destroyed while its frame is still running.
+    (void)try_with_gate(_task_gate,
+            [this, conn_fd = std::move(ar.connection),
+             remote_address = std::move(ar.remote_address), tls,
+             // Held for as long as this connection is being served, so that removing the
+             // listener it arrived on waits for it.
+             &listener, listener_hold = listener.connections_gate.hold()]() mutable {
+        return do_process_connection(std::move(conn_fd), std::move(remote_address), tls,
+                listener, std::move(listener_hold));
+    }).handle_exception_type([] (const gate_closed_exception& e) {});
+}
+
+// Named member coroutine for per-connection processing, called from the
+// non-coroutine lambda in try_with_gate inside do_accept_one(). Parameters
+// are passed by value so they live safely in the coroutine frame.
+future<> http_server::do_process_connection(connected_socket conn_fd, socket_address remote_address,
+        bool tls, listener_entry& listener, gate::holder listener_hold) {
+    auto local_address = conn_fd.local_address();
+    auto conn = std::make_unique<connection>(*this, std::move(conn_fd),
+            std::move(remote_address), std::move(local_address), tls);
+    // Which listener this connection arrived on, so that removing that listener can find
+    // it. Not its address: a wildcard listener and the proxy protocol both make the two
+    // disagree.
+    conn->_listener = &listener;
+    try {
+        co_await conn->prepare();
+    } catch (...) {
+        ++_tls_handshake_errors;
+        hlogger.debug("connection preparation failed: {}", seastar::formattable(std::current_exception()));
+        co_return;
+    }
+    if (_request_scheduling_group) {
+        co_await coroutine::switch_to(*_request_scheduling_group);
+    }
+    try {
+        co_await conn->process();
+    } catch (...) {
+        hlogger.error("request error: {}", seastar::formattable(std::current_exception()));
+    }
 }
 
 uint64_t http_server::total_connections() const {
@@ -477,6 +864,9 @@ uint64_t http_server::read_errors() const {
 }
 uint64_t http_server::reply_errors() const {
     return _respond_errors;
+}
+uint64_t http_server::tls_handshake_errors() const {
+    return _tls_handshake_errors;
 }
 
 // Write the current date in the specific "preferred format" defined in
@@ -505,7 +895,7 @@ future<> http_server_control::start(const sstring& name) {
     return _server_dist->start(name);
 }
 
-future<> http_server_control::stop() {
+future<> http_server_control::stop() noexcept {
     return _server_dist->stop();
 }
 
@@ -531,7 +921,7 @@ future<> http_server_control::listen(socket_address addr, listen_options lo, htt
     return _server_dist->invoke_on_all<future<> (http_server::*)(socket_address, listen_options, http_server::server_credentials_ptr)>(&http_server::listen, addr, lo, credentials);
 }
 
-distributed<http_server>& http_server_control::server() {
+sharded<http_server>& http_server_control::server() {
     return *_server_dist;
 }
 

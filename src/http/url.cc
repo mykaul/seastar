@@ -19,17 +19,10 @@
  * Copyright (C) 2022 Scylladb, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <string_view>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/http/url.hh>
-#endif
 
 namespace seastar {
 namespace http {
@@ -37,21 +30,32 @@ namespace internal {
 
 namespace {
 
+bool is_hex_digit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
 short hex_to_byte(char c) {
-    if (c >='a' && c <= 'z') {
+    if (c >= 'a' && c <= 'f') {
         return c - 'a' + 10;
-    } else if (c >='A' && c <= 'Z') {
+    } else if (c >= 'A' && c <= 'F') {
         return c - 'A' + 10;
+    } else if (c >= '0' && c <= '9') {
+        return c - '0';
     }
-    return c - '0';
+    return -1;
 }
 
 /**
- * Convert a hex encoded 2 bytes substring to char
+ * Convert a hex encoded 2 bytes substring to char.
+ * Returns -1 if either character is not a valid hex digit.
  */
-char hexstr_to_char(const std::string_view& in, size_t from) {
-
-    return static_cast<char>(hex_to_byte(in[from]) * 16 + hex_to_byte(in[from + 1]));
+short hexstr_to_char(std::string_view in, size_t from) {
+    auto hi = hex_to_byte(in[from]);
+    auto lo = hex_to_byte(in[from + 1]);
+    if (hi < 0 || lo < 0) {
+        return -1;
+    }
+    return static_cast<short>(hi * 16 + lo);
 }
 
 bool should_encode(char c) {
@@ -67,31 +71,40 @@ inline char char_to_hex(unsigned char val) {
     return "0123456789ABCDEF"[val];
 }
 
-}
-
-bool url_decode(const std::string_view& in, sstring& out) {
+bool decode(bool replace_plus, std::string_view in, sstring& out) {
     size_t pos = 0;
     sstring buff(in.length(), 0);
     for (size_t i = 0; i < in.length(); ++i) {
         if (in[i] == '%') {
-            if (i + 3 <= in.size()) {
-                buff[pos++] = hexstr_to_char(in, i + 1);
+            if (i + 2 < in.size() && is_hex_digit(in[i + 1]) && is_hex_digit(in[i + 2])) {
+                buff[pos++] = static_cast<char>(hexstr_to_char(in, i + 1));
                 i += 2;
             } else {
-                return false;
+                buff[pos++] = '%';
             }
-        } else if (in[i] == '+') {
+        } else if (replace_plus && in[i] == '+') {
             buff[pos++] = ' ';
         } else {
             buff[pos++] = in[i];
         }
     }
     buff.resize(pos);
-    out = buff;
+    out = std::move(buff);
     return true;
 }
 
-sstring url_encode(const std::string_view& in) {
+}
+
+bool url_decode(std::string_view in, sstring& out) {
+    return decode(true, in, out);
+}
+
+bool path_decode(std::string_view in, sstring& out) {
+    return decode(false, in, out);
+}
+
+
+sstring url_encode(std::string_view in) {
     size_t encodable_chars = 0;
     for (size_t i = 0; i < in.length(); i++) {
         if (should_encode(in[i])) {

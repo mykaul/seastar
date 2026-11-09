@@ -19,32 +19,23 @@
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <fstream>
 #include <cstdlib>
 #include <chrono>
 #include <iostream>
-#include <fmt/format.h>
+#include <seastar/core/internal/fmt.hh>
 #include <boost/program_options.hpp>
 #include <boost/make_shared.hpp>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/app-template.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/alien.hh>
-#include <seastar/core/scollectd.hh>
 #include <seastar/core/metrics_api.hh>
-#include <seastar/core/print.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/log-cli.hh>
 #include <seastar/net/native-stack.hh>
 #include "program_options.hh"
-#endif
 
 namespace seastar {
 
@@ -70,7 +61,6 @@ app_template::seastar_options::seastar_options()
     , reactor_opts(this)
     , metrics_opts(this)
     , smp_opts(this)
-    , scollectd_opts(this)
     , log_opts(this)
 {
 }
@@ -166,7 +156,7 @@ int
 app_template::run(int ac, char ** av, std::function<future<int> ()>&& func) noexcept {
     return run_deprecated(ac, av, [func = std::move(func)] () mutable {
         auto func_done = make_lw_shared<promise<>>();
-        engine().at_exit([func_done] { return func_done->get_future(); });
+        internal::at_exit([func_done] { return func_done->get_future(); });
         // No need to wait for this future.
         // func's returned exit_code is communicated via engine().exit()
         (void)futurize_invoke(func).finally([func_done] {
@@ -188,20 +178,45 @@ app_template::run(int ac, char ** av, std::function<future<> ()>&& func) noexcep
 
 int
 app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) noexcept {
-#ifdef SEASTAR_DEBUG
-    fmt::print(std::cerr, "WARNING: debug mode. Not for benchmarking or production\n");
-#endif
     boost::program_options::options_description all_opts;
     all_opts.add(_app_opts);
     all_opts.add(_seastar_opts);
 
     bpo::variables_map configuration;
     try {
+        // bpo::store() keeps the first value it is given for an ordinary
+        // option, so the order of these three is their precedence: the command
+        // line beats SEASTAR_OPTIONS, which beats the configuration file. An
+        // option declared with boost's composing() semantic is the exception:
+        // its values accumulate across all three rather than the first source
+        // claiming it. No Seastar option is declared that way, but an
+        // application's own option may be.
         bpo::store(bpo::command_line_parser(ac, av)
                     .options(all_opts)
                     .positional(_pos_opts)
                     .run()
             , configuration);
+        if (const char* env_options = std::getenv("SEASTAR_OPTIONS")) {
+            // Split the way a shell would, so a value containing spaces can be
+            // quoted. The empty positional description rejects anything which is
+            // not an option: this sets options, it does not stand in for a
+            // command line. Without it a stray word is silently dropped.
+            //
+            // Catch std::exception, not just bpo::error: a bad escape makes
+            // bpo::split_unix throw boost::escaped_list_error, which is a
+            // std::runtime_error. Naming the variable in the message also
+            // matters here, since the command line the user typed is fine.
+            try {
+                bpo::store(bpo::command_line_parser(bpo::split_unix(env_options))
+                            .options(all_opts)
+                            .positional(bpo::positional_options_description())
+                            .run()
+                    , configuration);
+            } catch (const std::exception& e) {
+                fmt::print("error in SEASTAR_OPTIONS: {}\n\nTry --help.\n", e.what());
+                return 2;
+            }
+        }
         _conf_reader(configuration);
     } catch (bpo::error& e) {
         fmt::print("error: {}\n\nTry --help.\n", e.what());
@@ -212,15 +227,15 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
             std::cout << _opts.description << "\n";
         }
         std::cout << _app_opts << "\n";
-        return 1;
+        return 0;
     }
     if (configuration.count("help-seastar")) {
         std::cout << _seastar_opts << "\n";
-        return 1;
+        return 0;
     }
     if (configuration.count("help-loggers")) {
         log_cli::print_available_loggers(std::cout);
-        return 1;
+        return 0;
     }
 
     try {
@@ -251,18 +266,14 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
     try {
         _smp->configure(_opts.smp_opts, _opts.reactor_opts);
     } catch (...) {
-        std::cerr << "Could not initialize seastar: " << std::current_exception() << std::endl;
+        std::cerr << fmt::format("Could not initialize seastar: {}\n", seastar::formattable(std::current_exception()));
         return 1;
     }
     _configuration = {std::move(configuration)};
     // No need to wait for this future.
     // func is waited on via engine().run()
     (void)engine().when_started().then([this] {
-        return seastar::metrics::configure(_opts.metrics_opts).then([this] {
-            // set scollectd use the metrics configuration, so the later
-            // need to be set first
-            scollectd::configure( _opts.scollectd_opts);
-        });
+        return seastar::metrics::configure(_opts.metrics_opts);
     }).then(
         std::move(func)
     ).then_wrapped([] (auto&& f) {

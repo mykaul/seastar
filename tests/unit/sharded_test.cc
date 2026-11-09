@@ -21,7 +21,13 @@
 
 #include <seastar/testing/thread_test_case.hh>
 
+#include <seastar/core/shard_id.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/util/assert.hh>
+
+#include <atomic>
+#include <ranges>
 
 using namespace seastar;
 
@@ -38,7 +44,7 @@ public:
 
     ~invoke_on_during_stop() {
         if (this_shard_id() == 0) {
-            assert(flag);
+            SEASTAR_ASSERT(flag);
         }
     }
 };
@@ -90,8 +96,8 @@ SEASTAR_THREAD_TEST_CASE(test_const_map_reduces) {
     sharded<peering_counter> c;
     c.start().get();
 
-    BOOST_REQUIRE_EQUAL(c.local().count().get0(), smp::count);
-    BOOST_REQUIRE_EQUAL(c.local().count_from(1).get0(), smp::count + 1);
+    BOOST_REQUIRE_EQUAL(c.local().count().get(), this_smp_shard_count());
+    BOOST_REQUIRE_EQUAL(c.local().count_from(1).get(), this_smp_shard_count() + 1);
 
     c.stop().get();
 }
@@ -100,10 +106,10 @@ SEASTAR_THREAD_TEST_CASE(test_member_map_reduces) {
     sharded<peering_counter> c;
     c.start().get();
 
-    BOOST_REQUIRE_EQUAL(std::as_const(c.local()).count_const().get0(), smp::count);
-    BOOST_REQUIRE_EQUAL(c.local().count_mutate().get0(), smp::count);
-    BOOST_REQUIRE_EQUAL(std::as_const(c.local()).count_from_const(1).get0(), smp::count + 1);
-    BOOST_REQUIRE_EQUAL(c.local().count_from_mutate(1).get0(), smp::count + 1);
+    BOOST_REQUIRE_EQUAL(std::as_const(c.local()).count_const().get(), this_smp_shard_count());
+    BOOST_REQUIRE_EQUAL(c.local().count_mutate().get(), this_smp_shard_count());
+    BOOST_REQUIRE_EQUAL(std::as_const(c.local()).count_from_const(1).get(), this_smp_shard_count() + 1);
+    BOOST_REQUIRE_EQUAL(c.local().count_from_mutate(1).get(), this_smp_shard_count() + 1);
     c.stop().get();
 }
 
@@ -122,7 +128,7 @@ SEASTAR_THREAD_TEST_CASE(invoke_map_returns_non_future_value) {
         return m.x;
     }).then([] (std::vector<int> results) {
         for (auto& x : results) {
-            assert(x == 1);
+            SEASTAR_ASSERT(x == 1);
         }
     }).get();
     s.stop().get();
@@ -135,7 +141,7 @@ SEASTAR_THREAD_TEST_CASE(invoke_map_returns_future_value) {
         return make_ready_future<int>(m.x);
     }).then([] (std::vector<int> results) {
         for (auto& x : results) {
-            assert(x == 1);
+            SEASTAR_ASSERT(x == 1);
         }
     }).get();
     s.stop().get();
@@ -150,7 +156,7 @@ SEASTAR_THREAD_TEST_CASE(invoke_map_returns_future_value_from_thread) {
         });
     }).then([] (std::vector<int> results) {
         for (auto& x : results) {
-            assert(x == 1);
+            SEASTAR_ASSERT(x == 1);
         }
     }).get();
     s.stop().get();
@@ -164,6 +170,37 @@ SEASTAR_THREAD_TEST_CASE(failed_sharded_start_doesnt_hang) {
 
     seastar::sharded<fail_to_start> s;
     s.start().then_wrapped([] (auto&& fut) { fut.ignore_ready_future(); }).get();
+}
+
+// If constructing the service fails on just one shard, start() should stop
+// and destroy the instances it already constructed on the other shards, and
+// fail with the constructor's exception.
+SEASTAR_THREAD_TEST_CASE(failed_sharded_start_stops_started_instances) {
+    static std::atomic<unsigned> constructed;
+    static std::atomic<unsigned> stopped;
+    static std::atomic<unsigned> destroyed;
+    class fail_on_last_shard {
+    public:
+        fail_on_last_shard() {
+            if (this_shard_id() == this_smp_shard_count() - 1) {
+                throw std::runtime_error("fail_on_last_shard");
+            }
+            ++constructed;
+        }
+        ~fail_on_last_shard() { ++destroyed; }
+        future<> stop() {
+            ++stopped;
+            return make_ready_future<>();
+        }
+    };
+
+    seastar::sharded<fail_on_last_shard> s;
+    BOOST_REQUIRE_EXCEPTION(s.start().get(), std::runtime_error, [] (const std::runtime_error& e) {
+        return std::string_view(e.what()) == "fail_on_last_shard";
+    });
+    BOOST_REQUIRE_EQUAL(constructed.load(), this_smp_shard_count() - 1);
+    BOOST_REQUIRE_EQUAL(stopped.load(), this_smp_shard_count() - 1);
+    BOOST_REQUIRE_EQUAL(destroyed.load(), this_smp_shard_count() - 1);
 }
 
 class argument {
@@ -200,4 +237,101 @@ SEASTAR_THREAD_TEST_CASE(invoke_on_all_sharded_arg) {
 
     srv.stop().get();
     arg.stop().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(invoke_on_modifiers) {
+    class checker {
+    public:
+        future<> fn(int a) {
+            return make_ready_future<>();
+        }
+    };
+
+    seastar::sharded<checker> srv;
+    srv.start().get();
+    int a = 42;
+
+    srv.invoke_on_all([a] (checker& s) { return s.fn(a); }).get();
+    srv.invoke_on_all([a] (checker& s) mutable { return s.fn(a); }).get();
+    srv.invoke_on_others([a] (checker& s) { return s.fn(a); }).get();
+    srv.invoke_on_others([a] (checker& s) mutable { return s.fn(a); }).get();
+
+    srv.stop().get();
+}
+
+class coordinator_synced_shard_map : public peering_sharded_service<coordinator_synced_shard_map> {
+    std::vector<unsigned> unsigned_per_shard;
+    unsigned coordinator_id;
+
+public:
+    coordinator_synced_shard_map(unsigned coordinator_id) : unsigned_per_shard(this_smp_shard_count()), coordinator_id(coordinator_id) {}
+
+    future<> sync(unsigned value) {
+        return container().invoke_on(coordinator_id, [shard_id = this_shard_id(), value] (coordinator_synced_shard_map& s) {
+            s.unsigned_per_shard[shard_id] = value;
+        });
+    }
+
+    unsigned get_synced(int shard_id) {
+        SEASTAR_ASSERT(this_shard_id() == coordinator_id);
+        return unsigned_per_shard[shard_id];
+    }
+};
+
+SEASTAR_THREAD_TEST_CASE(invoke_on_range_contiguous) {
+    sharded<coordinator_synced_shard_map> s;
+    auto coordinator_id = this_shard_id();
+    s.start(coordinator_id).get();
+
+    auto mid = this_smp_shard_count() / 2;
+    auto half1 = std::views::iota(0u, mid);
+    auto half1_id = 1;
+    auto half2 = std::views::iota(mid, this_smp_shard_count());
+    auto half2_id = 2;
+
+    auto f1 = s.invoke_on(half1, [half1_id] (coordinator_synced_shard_map& s) { return s.sync(half1_id); });
+    auto f2 = s.invoke_on(half2, [half2_id] (coordinator_synced_shard_map& s) { return s.sync(half2_id); });
+    f1.get();
+    f2.get();
+
+    auto f3 = s.invoke_on(coordinator_id, [mid, half1_id, half2_id] (coordinator_synced_shard_map& s) {
+        for (unsigned i = 0; i < mid; ++i) {
+            BOOST_REQUIRE_EQUAL(half1_id, s.get_synced(i));
+        }
+        for (unsigned i = mid; i < this_smp_shard_count(); ++i) {
+            BOOST_REQUIRE_EQUAL(half2_id, s.get_synced(i));
+        }
+    });
+    f3.get();
+
+    s.stop().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(invoke_on_range_fragmented) {
+    sharded<coordinator_synced_shard_map> s;
+    auto coordinator_id = this_shard_id();
+    s.start(coordinator_id).get();
+
+    // TODO: migrate to C++23 std::views::stride
+    auto even = std::views::iota(0u, this_smp_shard_count()) | std::views::filter([](int i) { return i % 2 == 0; });
+    auto even_id = 1;
+    auto odd = std::views::iota(1u, this_smp_shard_count()) | std::views::filter([](int i) { return i % 2 == 1; });
+    auto odd_id = 2;
+
+    auto f1 = s.invoke_on(even, [even_id] (coordinator_synced_shard_map& s) { return s.sync(even_id); });
+    auto f2 = s.invoke_on(odd, [odd_id] (coordinator_synced_shard_map& s) { return s.sync(odd_id); });
+    f1.get();
+    f2.get();
+
+    auto f3 = s.invoke_on(coordinator_id, [even_id, odd_id] (coordinator_synced_shard_map& s) {
+        for (unsigned i = 0; i < this_smp_shard_count(); i += 2) {
+            BOOST_REQUIRE_EQUAL(even_id, s.get_synced(i));
+        }
+        for (unsigned i = 1; i < this_smp_shard_count(); i += 2) {
+            BOOST_REQUIRE_EQUAL(odd_id, s.get_synced(i));
+        }
+    });
+    f3.get();
+
+    s.stop().get();
 }

@@ -21,7 +21,7 @@
 
 #define BOOST_TEST_MODULE core
 // formatting of std::optional was introduced in fmt 10
-#define FMT_VERSION_OPTIONAL_FORMAT 100000 
+#define FMT_VERSION_OPTIONAL_FORMAT 100000
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/sstring.hh>
@@ -90,6 +90,30 @@ BOOST_AUTO_TEST_CASE(test_find_sstring_compatible) {
     check_find("abcde", "", 6);
 }
 
+BOOST_AUTO_TEST_CASE(test_find_char_sstring_compatible) {
+    auto check_find = [](const char* s1, char c, size_t pos) {
+        const auto xpos_ss = sstring(s1).find(c, pos);
+        const auto xpos_std = std::string(s1).find(c, pos);
+
+        // verify that std::string really has the same behavior as we just tested for sstring
+        if (xpos_ss == sstring::npos) {  // sstring::npos may not equal std::string::npos ?
+            BOOST_REQUIRE_EQUAL(xpos_std, std::string::npos);
+        } else {
+            BOOST_REQUIRE_EQUAL(xpos_ss, xpos_std);
+        }
+    };
+
+    // pos at or past the end must not find anything, in particular npos must not
+    // wrap around and make the search start before the beginning of the buffer
+    for (const char* s : {"", "xyzabc", "xyzabc0123456789_this_one_is_heap_allocated"}) {
+        check_find(s, 'a', 0);
+        check_find(s, 'a', sstring(s).size());
+        check_find(s, 'a', sstring(s).size() + 1);
+        check_find(s, 'a', sstring::npos);
+        check_find(s, 'x', sstring::npos);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(test_not_find_sstring) {
     BOOST_REQUIRE_EQUAL(sstring("abcde").find('x'), sstring::npos);
 }
@@ -113,6 +137,8 @@ BOOST_AUTO_TEST_CASE(test_str_not_find_sstring) {
 }
 
 BOOST_AUTO_TEST_CASE(test_str_starts_with) {
+    BOOST_CHECK(std::string("abcdefg").starts_with("abcdefg"));
+    BOOST_CHECK(sstring("abcdefg").starts_with("abcdefg"));
     BOOST_CHECK(sstring("abcdefg").starts_with("ab"sv));
     BOOST_CHECK(sstring("abcde").starts_with('a'));
     BOOST_CHECK(sstring("abcde").starts_with("ab"));
@@ -125,6 +151,8 @@ BOOST_AUTO_TEST_CASE(test_str_starts_with) {
 }
 
 BOOST_AUTO_TEST_CASE(test_str_ends_with) {
+    BOOST_CHECK(std::string("abcdefg").ends_with("abcdefg"));
+    BOOST_CHECK(sstring("abcdefg").ends_with("abcdefg"));
     BOOST_CHECK(sstring("abcdefg").ends_with("efg"sv));
     BOOST_CHECK(sstring("abcde").ends_with('e'));
     BOOST_CHECK(sstring("abcde").ends_with("de"));
@@ -301,11 +329,9 @@ BOOST_AUTO_TEST_CASE(test_resize_and_overwrite) {
 
 BOOST_AUTO_TEST_CASE(test_compares_left_hand_not_string) {
     // mostly a compile test for non-sstring left-hand-side
-#if __cplusplus > 201703L
     BOOST_REQUIRE("a" == sstring("a"));
     BOOST_REQUIRE(std::string("a") == sstring("a"));
     BOOST_REQUIRE(std::string_view("a") == sstring("a"));
-#endif
 
 #ifdef __cpp_lib_three_way_comparison
     BOOST_REQUIRE("a" < sstring("b"));
@@ -313,7 +339,6 @@ BOOST_AUTO_TEST_CASE(test_compares_left_hand_not_string) {
 #endif
 }
 
-#if FMT_VERSION >= 90000
 
 BOOST_AUTO_TEST_CASE(test_fmt) {
 #if FMT_VERSION >= FMT_VERSION_OPTIONAL_FORMAT
@@ -324,4 +349,98 @@ BOOST_AUTO_TEST_CASE(test_fmt) {
     std::ignore = fmt::format("{}", strings);
 }
 
+BOOST_AUTO_TEST_CASE(test_fmt_format) {
+    sstring s("abc");
+    BOOST_REQUIRE_EQUAL(fmt::format("{}", s), "abc");
+    BOOST_REQUIRE_EQUAL(fmt::format("{:>5}", s), "  abc");
+    BOOST_REQUIRE_EQUAL(fmt::format("{}", std::vector<sstring>{s, "d"}), R"(["abc", "d"])");
+}
+
+#ifdef __cpp_lib_format
+BOOST_AUTO_TEST_CASE(test_std_format) {
+    sstring s("abc");
+    BOOST_REQUIRE_EQUAL(std::format("{}", s), "abc");
+    BOOST_REQUIRE_EQUAL(std::format("{:>5}", s), "  abc");
+    BOOST_REQUIRE_EQUAL(std::format("{:.2}", s), "ab");
+#ifdef __cpp_lib_format_ranges
+    BOOST_REQUIRE_EQUAL(std::format("{:?}", s), R"("abc")");
+    BOOST_REQUIRE_EQUAL(std::format("{}", std::vector<sstring>{s, "d"}), R"(["abc", "d"])");
 #endif
+}
+#endif
+
+
+// A std::allocator lookalike, only to check that operator+ accepts a
+// std::basic_string with an allocator other than the default one.
+template <typename T>
+struct tracking_allocator : std::allocator<T> {
+    using std::allocator<T>::allocator;
+    template <typename U> struct rebind { using other = tracking_allocator<U>; };
+};
+
+BOOST_AUTO_TEST_CASE(test_concat_with_std_string) {
+    sstring a = "ab";
+    const sstring ca = "ab";
+    std::string b = "cd";
+    const std::string cb = "cd";
+
+    // Every combination of lvalue/const lvalue/rvalue on either side has to
+    // resolve. Since C++26 std::basic_string has operator+ overloads taking a
+    // string_view-convertible operand, and those are reachable from
+    // basic_sstring, so they can tie with basic_sstring's own operator+ unless
+    // sstring provides better matches.
+    BOOST_REQUIRE_EQUAL(a + b, sstring("abcd"));
+    BOOST_REQUIRE_EQUAL(ca + cb, sstring("abcd"));
+    BOOST_REQUIRE_EQUAL(a + std::string("cd"), sstring("abcd"));
+    BOOST_REQUIRE_EQUAL(sstring("ab") + b, sstring("abcd"));
+    BOOST_REQUIRE_EQUAL(sstring("ab") + std::string("cd"), sstring("abcd"));
+
+    BOOST_REQUIRE_EQUAL(b + a, sstring("cdab"));
+    BOOST_REQUIRE_EQUAL(cb + ca, sstring("cdab"));
+    BOOST_REQUIRE_EQUAL(std::string("cd") + a, sstring("cdab"));
+    BOOST_REQUIRE_EQUAL(b + sstring("ab"), sstring("cdab"));
+    BOOST_REQUIRE_EQUAL(std::string("cd") + sstring("ab"), sstring("cdab"));
+
+    // The most common shape in practice.
+    BOOST_REQUIRE_EQUAL(sstring("n=") + std::to_string(7), sstring("n=7"));
+    BOOST_REQUIRE_EQUAL(a + ":" + std::to_string(7), sstring("ab:7"));
+
+    // The result is an sstring, not a std::string, whichever side it is on.
+    static_assert(std::is_same_v<decltype(a + b), sstring>);
+    static_assert(std::is_same_v<decltype(b + a), sstring>);
+    static_assert(std::is_same_v<decltype(std::string("cd") + a), sstring>);
+
+    // Concatenating two sstrings, or a literal and an sstring, is unaffected.
+    static_assert(std::is_same_v<decltype(a + a), sstring>);
+    BOOST_REQUIRE_EQUAL(a + a, sstring("abab"));
+    BOOST_REQUIRE_EQUAL("x" + a, sstring("xab"));
+
+    // Embedded NULs are not treated as terminators.
+    std::string nul("a\0b", 3);
+    BOOST_REQUIRE_EQUAL((sstring("z") + nul).size(), 4u);
+    BOOST_REQUIRE_EQUAL((nul + sstring("z")).size(), 4u);
+
+    // An empty operand on either side.
+    BOOST_REQUIRE_EQUAL(a + std::string(), sstring("ab"));
+    BOOST_REQUIRE_EQUAL(std::string() + a, sstring("ab"));
+    BOOST_REQUIRE_EQUAL(sstring() + b, sstring("cd"));
+
+    // A long result, so that the sstring is externally allocated.
+    std::string long_b(1000, 'y');
+    BOOST_REQUIRE_EQUAL((a + long_b).size(), 1002u);
+    BOOST_REQUIRE_EQUAL((long_b + a).size(), 1002u);
+    BOOST_REQUIRE_EQUAL(a + long_b, sstring("ab") + sstring(long_b));
+
+    // A non-default char_type and a non-NUL-terminated sstring.
+    using schar_sstring = basic_sstring<signed char, uint32_t, 15, false>;
+    schar_sstring s(reinterpret_cast<const signed char*>("ab"), 2);
+    std::basic_string<signed char> t(reinterpret_cast<const signed char*>("cd"), 2);
+    BOOST_REQUIRE_EQUAL((s + t).size(), 4u);
+    BOOST_REQUIRE_EQUAL((t + s).size(), 4u);
+    static_assert(std::is_same_v<decltype(s + t), schar_sstring>);
+
+    // A std::basic_string with a non-default allocator is still accepted.
+    std::basic_string<char, std::char_traits<char>, tracking_allocator<char>> alloc_b = "cd";
+    BOOST_REQUIRE_EQUAL(a + alloc_b, sstring("abcd"));
+    BOOST_REQUIRE_EQUAL(alloc_b + a, sstring("cdab"));
+}

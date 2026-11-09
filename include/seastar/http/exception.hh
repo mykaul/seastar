@@ -22,15 +22,16 @@
 #pragma once
 
 #include <seastar/util/log.hh>
-#include <seastar/util/modules.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/json/json_elements.hh>
+#include <initializer_list>
+#include <utility>
+#include <vector>
 
 namespace seastar {
 
 namespace httpd {
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 /**
  * The base_exception is a base for all http exception.
@@ -61,15 +62,33 @@ private:
 };
 
 /**
- * Throwing this exception will result in a redirect to the given url
+ * Throwing this exception will result in a redirect to the given url.
+ * Optional extra headers can be included in the redirect response.
  */
 class redirect_exception : public base_exception {
 public:
-    redirect_exception(const std::string& url)
-            : base_exception("", http::reply::status_type::moved_permanently), url(
-                    url) {
+    using header_list = std::initializer_list<std::pair<std::string, std::string>>;
+
+    redirect_exception(const std::string& url,
+                       http::reply::status_type status = http::reply::status_type::moved_permanently,
+                       header_list extra_headers = {})
+            : base_exception("", status), url(url), _extra_headers(extra_headers) {
     }
+
+    /// Construct an http::reply for this redirect, with Location header and status set.
+    http::reply to_reply() const {
+        http::reply reply{};
+        reply.add_header("Location", url);
+        for (const auto& [name, value] : _extra_headers) {
+            reply.add_header(name, value);
+        }
+        reply.set_status(status());
+        return reply;
+    }
+
     std::string url;
+private:
+    std::vector<std::pair<std::string, std::string>> _extra_headers;
 };
 
 /**
@@ -123,7 +142,12 @@ public:
     }
 };
 
-class json_exception : public json::json_base {
+class response_parsing_exception : public server_error_exception {
+public:
+    explicit response_parsing_exception(const std::string& msg) : server_error_exception(msg) {}
+};
+
+class [[deprecated("Use base_exception or any of its inheritants instead")]] json_exception : public json::json_base {
 public:
     json::json_element<std::string> _msg;
     json::json_element<int> _code;
@@ -137,9 +161,7 @@ public:
     }
 
     json_exception(std::exception_ptr e) {
-        std::ostringstream exception_description;
-        exception_description << e;
-        set(exception_description.str(), http::reply::status_type::internal_server_error);
+        set(fmt::format("{}", seastar::formattable(e)), http::reply::status_type::internal_server_error);
     }
 private:
     void set(const std::string& msg, http::reply::status_type code) {
@@ -155,16 +177,14 @@ private:
 class unexpected_status_error : public base_exception {
 public:
     unexpected_status_error(http::reply::status_type st)
-        : base_exception("Unexpected reply status", st)
+        : base_exception(fmt::to_string(st), st)
     {}
 };
 
-SEASTAR_MODULE_EXPORT_END
 }
 
 }
 
-SEASTAR_MODULE_EXPORT
 template <>
 struct fmt::formatter<seastar::httpd::base_exception> {
     constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }

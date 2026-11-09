@@ -20,23 +20,16 @@
  * Copyright (C) 2018 Red Hat
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#endif
 
 #include <atomic>
 #include <iterator>
 #include <memory>
 #include <vector>
 
-#ifdef SEASTAR_MODULE
-module seastar;
-#else
 #include <seastar/core/alien.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/prefetch.hh>
-#endif
 
 namespace seastar {
 namespace alien {
@@ -53,10 +46,7 @@ void
 message_queue::lf_queue::maybe_wakeup() {
     // see also smp_message_queue::lf_queue::maybe_wakeup()
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (remote->_sleeping.load(std::memory_order_relaxed)) {
-        remote->_sleeping.store(false, std::memory_order_relaxed);
-        remote->wakeup();
-    }
+    remote->wakeup();
 }
 
 void message_queue::submit_item(std::unique_ptr<message_queue::work_item> item) {
@@ -127,15 +117,19 @@ void message_queue::start() {
 }
 
 
+static constexpr std::align_val_t message_queue_alignment{alignof(alien::message_queue)};
+
 void internal::qs_deleter::operator()(alien::message_queue* qs) const {
     for (unsigned i = 0; i < count; i++) {
         qs[i].~message_queue();
     }
-    ::operator delete[](qs);
+    ::operator delete[](qs, message_queue_alignment);
 }
 
 instance::qs instance::create_qs(const std::vector<reactor*>& reactors) {
-    auto queues = reinterpret_cast<alien::message_queue*>(operator new[] (sizeof(alien::message_queue) * reactors.size()));
+    auto queues = reinterpret_cast<alien::message_queue*>(
+            operator new[](sizeof(alien::message_queue) * reactors.size(),
+                           message_queue_alignment));
     for (unsigned i = 0; i < reactors.size(); i++) {
         new (&queues[i]) alien::message_queue(reactors[i]);
     }

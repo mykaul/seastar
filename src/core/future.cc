@@ -19,21 +19,12 @@
  * Copyright (C) 2020 ScyllaDB
  */
 
-#ifdef SEASTAR_MODULE
-module;
-#include <cassert>
-#include <exception>
-#include <tuple>
-#include <type_traits>
-#include <utility>
-module seastar;
-#else
 #include <seastar/core/future.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/report_exception.hh>
 #include <seastar/util/backtrace.hh>
-#endif
+#include <seastar/util/assert.hh>
 
 namespace seastar {
 
@@ -64,6 +55,9 @@ void promise_base::move_it(promise_base&& x) noexcept {
     // if &x == this.
     _task = x._task;
     x._task = nullptr;
+#ifdef SEASTAR_DEBUG_PROMISE
+    _task_shard = x._task_shard;
+#endif
     _state = x._state;
     x._state = nullptr;
     _future = x._future;
@@ -86,17 +80,14 @@ promise_base::promise_base(promise_base&& x) noexcept {
     move_it(std::move(x));
 }
 
-void promise_base::clear() noexcept {
-    if (__builtin_expect(bool(_task), false)) {
-        assert(_state && !_state->available());
-        set_to_broken_promise(*_state);
+void promise_base::clear_on_broken() noexcept {
+    SEASTAR_ASSERT(_state && !_state->available());
+    set_to_broken_promise(*_state);
+    if (_task) {
         ::seastar::schedule(std::exchange(_task, nullptr));
     }
     if (_future) {
-        assert(_state);
-        if (!_state->available()) {
-            set_to_broken_promise(*_state);
-        }
+        SEASTAR_ASSERT(_state);
         _future->detach_promise();
     }
 }
@@ -111,19 +102,16 @@ void promise_base::set_to_current_exception() noexcept {
     set_exception(std::current_exception());
 }
 
-template <promise_base::urgent Urgent>
-void promise_base::make_ready() noexcept {
-    if (_task) {
-        if (Urgent == urgent::yes) {
-            ::seastar::schedule_urgent(std::exchange(_task, nullptr));
-        } else {
-            ::seastar::schedule(std::exchange(_task, nullptr));
-        }
+#ifdef SEASTAR_DEBUG_PROMISE
+
+void promise_base::assert_task_shard() const noexcept {
+    if (_task_shard >= 0 && static_cast<shard_id>(_task_shard) != this_shard_id()) {
+        on_fatal_internal_error(seastar_logger, format("Promise task was set on shard {} but made ready on shard {}", _task_shard, this_shard_id()));
     }
 }
 
-template void promise_base::make_ready<promise_base::urgent::no>() noexcept;
-template void promise_base::make_ready<promise_base::urgent::yes>() noexcept;
+#endif
+
 }
 
 template
@@ -153,7 +141,7 @@ void future_state_base::ignore() noexcept {
     case state::invalid:
     case state::future:
     case state::result_unavailable:
-        assert(0 && "invalid state for ignore");
+        SEASTAR_ASSERT(0 && "invalid state for ignore");
     case state::result:
         _u.st = state::result_unavailable;
         break;
@@ -211,9 +199,11 @@ void future_state_base::rethrow_exception() const& {
     std::rethrow_exception(_u.ex);
 }
 
+namespace internal {
+
 void report_failed_future(const std::exception_ptr& eptr) noexcept {
     ++engine()._abandoned_failed_futures;
-    seastar_logger.warn("Exceptional future ignored: {}, backtrace: {}", eptr, current_backtrace());
+    seastar_logger.warn("Exceptional future ignored: {}, backtrace: {}", seastar::formattable(eptr), current_backtrace());
 }
 
 void report_failed_future(const future_state_base& state) noexcept {
@@ -224,13 +214,15 @@ void report_failed_future(future_state_base::any&& state) noexcept {
     report_failed_future(std::move(state).take_exception());
 }
 
+} // internal namespace
+
 void reactor::test::with_allow_abandoned_failed_futures(unsigned count, noncopyable_function<void ()> func) {
     auto before = engine()._abandoned_failed_futures;
     auto old_level = seastar_logger.level();
     seastar_logger.set_level(log_level::error);
     func();
     auto after = engine()._abandoned_failed_futures;
-    assert(after - before == count);
+    SEASTAR_ASSERT(after - before == count);
     engine()._abandoned_failed_futures = before;
     seastar_logger.set_level(old_level);
 }
@@ -254,18 +246,16 @@ public:
 
 void internal::future_base::do_wait() noexcept {
     auto thread = thread_impl::get();
-    assert(thread);
+    SEASTAR_ASSERT(thread);
     thread_wake_task wake_task{thread};
     wake_task.make_backtrace();
-    _promise->_task = &wake_task;
+    _promise->set_task(&wake_task);
     thread_impl::switch_out(thread);
 }
 
-#ifdef SEASTAR_COROUTINES_ENABLED
 void internal::future_base::set_coroutine(task& coroutine) noexcept {
-    assert(_promise);
-    _promise->_task = &coroutine;
+    SEASTAR_ASSERT(_promise);
+    _promise->set_task(&coroutine);
 }
-#endif
 
 }

@@ -30,10 +30,10 @@ public:
 
 Think of the leading underscore as a shorthand for `this->`.
 
-Template parameters use `CamelCase`
+Template parameters use `CamelCase`.
 
 Note: because the Concept Technical Specification used CamelCase for concepts,
-some Seastar concepts alse use CamelCase. These will be gradually deprecated
+some Seastar concepts also use CamelCase. These will be gradually deprecated
 and replaced with snake_case names. New concepts should use snake_case.
 
 ## Including header files
@@ -54,7 +54,7 @@ Header files in Seastar must be self-contained, i.e., each can be included witho
 
 ## Braced blocks
 
-All nested scopes are braced, even when the language allows omitting the braces (such as an if-statement), this makes patches simpler and is more consistent. The opening brace is merged with the line that opens the scope (class definition, function definition, if statement, etc.) and the body is indented.
+All nested scopes are braced, even when the language allows omitting the braces (such as in an `if` statement); this makes patches simpler and the style more consistent. The opening brace is placed on the line that opens the scope (class definition, function definition, `if` statement, etc.), and the body is indented.
 
 ```c++
 void a_function() {
@@ -66,9 +66,9 @@ void a_function() {
 }
 ```
 
-An exception is namespaces -- the body is _not_ indented, to prevent files that are almost 100% whitespace left margin.
+Namespace bodies are an exception: they are _not_ indented, to prevent files from consisting almost entirely of whitespace in the left margin.
 
-When making a change, if you need to insert an indentation level, you can temporarily break the rules by insering a half-indent, so that the patch is easily reviewable:
+When making a change, if you need to insert an indentation level, you can temporarily break the rules by inserting a half-indent, so that the patch is easily reviewable:
 
 ```c++
 void a_function() {
@@ -90,9 +90,9 @@ Avoid output parameters; use return values instead.  In/out parameters are trick
 
 If a function accepts a lambda or an `std::function`, make it the last argument, so that it can be easily provided inline:
 
-```c++ 
+```c++
 template <typename Func>
-void function_accepting_a_lambda(int a, int b, Func func);
+int function_accepting_a_lambda(int a, int b, Func func);
 
 int f() {
     return function_accepting_a_lambda(2, 3, [] (int x, int y) {
@@ -116,7 +116,7 @@ a_struct<T1, T2>::a_function(T3 a, T4 b) {                         // And I'm th
 
 ## Whitespace around operators
 
-Whitespace around operators should match their precedence: high precedence = no spaces, low precedency = add spaces:
+Whitespace around operators should match their precedence: high precedence = no spaces, low precedence = add spaces:
 
 ```c++
      return *a + *b;  // good
@@ -127,7 +127,7 @@ Whitespace around operators should match their precedence: high precedence = no 
 
 ## Long lines
 
-If a line becomes excessively long (>120 characters?), or is just complicated, break it into two or more lines.  The second (and succeeding lines) are _continuation lines_, and have a double indent:
+If a line becomes excessively long (>160 characters?), or is just complicated, break it into two or more lines.  The second (and succeeding lines) are _continuation lines_, and have a double indent:
 
 ```c++
     if ((some_condition && some_other_condition)
@@ -143,7 +143,7 @@ Of course, long lines or complex conditions may indicate that refactoring is in 
 
 Generic lambdas (`[] (auto param)`) are discouraged where the type is known. Generic
 lambdas reduce the compiler's and other tools' ability to reason about the code.
-In case the actual type of `param` doesn't match the programmers expectations,
+If the actual type of `param` doesn't match the programmer's expectations,
 the compiler will only detect an error in the lambda body, or perhaps
 even lower down the stack if more generic functions are called. In the case of an
 IDE, most of its functionality is disabled in a generic lambda, since it can't
@@ -152,5 +152,3 @@ assume anything about that parameter.
 Of course, when there is a need to support multiple types, genericity is the correct
 tool. Even then, type parameters should be constrained with concepts, in order to
 catch type mismatches early rather than deep in the instantiation chain.
-
-

@@ -21,29 +21,24 @@
 
 #pragma once
 
-#ifndef SEASTAR_MODULE
 #include <cstddef>
-#include <seastar/util/modules.hh>
-#endif
+#include <new>
 
 namespace seastar {
 
-SEASTAR_MODULE_EXPORT_BEGIN
-
 // Platform-dependent cache line size for alignment and padding purposes.
-constexpr size_t cache_line_size =
-#if defined(__x86_64__) || defined(__i386__)
-    64;
-#elif defined(__s390x__) || defined(__zarch__)
-    256;
-#elif defined(__PPC64__)
-    128;
-#elif defined(__aarch64__)
-    128; // from Linux, may vary among different microarchitetures?
+// RISC-V: workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=116662
+#ifdef __riscv
+inline constexpr std::size_t cache_line_size = 64;
 #else
-#error "cache_line_size not defined for this architecture"
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winterference-size"
 #endif
-
-SEASTAR_MODULE_EXPORT_END
+inline constexpr std::size_t cache_line_size = std::hardware_destructive_interference_size;
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#endif
 
 }

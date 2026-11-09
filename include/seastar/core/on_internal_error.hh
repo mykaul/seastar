@@ -21,17 +21,12 @@
 
 #pragma once
 
-
-#include <seastar/util/std-compat.hh>
-#include <seastar/util/modules.hh>
-#ifndef SEASTAR_MODULE
+#include <cstdint>
 #include <exception>
 #include <string_view>
-#endif
 
 namespace seastar {
 
-SEASTAR_MODULE_EXPORT_BEGIN
 
 class logger;
 
@@ -69,8 +64,11 @@ void on_internal_error_noexcept(logger& logger, std::string_view reason) noexcep
 ///
 /// The error will be logged to \logger and the program will be aborted,
 /// regardless of the abort_on_internal_error setting.
-/// This overload can be used to replace assert().
+/// This overload can be used to replace SEASTAR_ASSERT().
 [[noreturn]] void on_fatal_internal_error(logger& logger, std::string_view reason) noexcept;
 
-SEASTAR_MODULE_EXPORT_END
+namespace internal {
+extern thread_local uint64_t internal_errors;
+}
+
 }

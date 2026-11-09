@@ -41,7 +41,7 @@ future<> now() {
 /// Schedules a future to run "soon". yield() can be used to break long-but-finite
 /// loops into pieces. Note that if nothing else is runnable,
 /// It will not check for I/O, and so an infinite loop with yield() will just
-/// burn CPU. 
+/// burn CPU.
 future<> yield() noexcept;
 
 /// Yield the cpu if the task quota is exhausted.
@@ -49,7 +49,7 @@ future<> yield() noexcept;
 /// Check if the current continuation is preempted and yield if so. Otherwise
 /// return a ready future.
 ///
-/// \note Threads and coroutines (see seastar::thread::maybe_yield() and 
+/// \note Threads and coroutines (see seastar::thread::maybe_yield() and
 ///       seastar::coroutine::maybe_yield() have their own custom variants,
 ///       and the various continuation-based loops (do_for_each() and similar)
 ///       do this automatically.
@@ -72,12 +72,6 @@ future<> maybe_yield() noexcept {
 ///       reactor schedule I/O polls itself.
 /// \note This has no effect on I/O polling on other shards.
 future<> check_for_io_immediately() noexcept;
-
-/// \brief Returns a future which is not ready but is scheduled to resolve soon.
-///
-/// \deprecated Use yield() instead, or check_for_io_immediately() if your really need it.
-[[deprecated("Use yield() or check_for_io_immediately()")]]
-future<> later() noexcept;
 
 /// @}
 

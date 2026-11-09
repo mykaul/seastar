@@ -22,14 +22,15 @@
 #pragma once
 
 #include <seastar/core/smp.hh>
-#include <seastar/core/deleter.hh>
-#include <seastar/core/queue.hh>
+#include <seastar/core/circular_buffer.hh>
 #include <seastar/core/stream.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/net/toeplitz.hh>
 #include <seastar/net/ethernet.hh>
 #include <seastar/net/packet.hh>
 #include <seastar/net/const.hh>
+#include <seastar/util/assert.hh>
+#include <map>
 #include <unordered_map>
 
 namespace seastar {
@@ -56,7 +57,7 @@ public:
         return end_idx;
     }
     void push_back(uint8_t b) {
-        assert(end_idx < sizeof(data));
+        SEASTAR_ASSERT(end_idx < sizeof(data));
         data[end_idx++] = b;
     }
     void push_back(uint16_t b) {
@@ -225,14 +226,13 @@ class qp {
     circular_buffer<packet> _tx_packetq;
 
 protected:
-    const std::string _stats_plugin_name;
     const std::string _queue_name;
     metrics::metric_groups _metrics;
     qp_stats _stats;
 
 public:
     qp(bool register_copy_stats = false,
-       const std::string stats_plugin_name = std::string("network"),
+       std::string port_name = "",
        uint8_t qid = 0);
     virtual ~qp();
     virtual future<> send(packet p) = 0;
@@ -266,7 +266,7 @@ protected:
     size_t _rss_table_bits = 0;
 public:
     device() {
-        _queues = std::make_unique<qp*[]>(smp::count);
+        _queues = std::make_unique<qp*[]>(this_smp_shard_count());
     }
     virtual ~device() {};
     qp& queue_for_cpu(unsigned cpu) { return *_queues[cpu]; }

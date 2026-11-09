@@ -26,7 +26,6 @@
 #include <setjmp.h>
 #include <ucontext.h>
 #include <chrono>
-#include <memory>
 
 namespace seastar {
 /// Clock used for scheduling threads
@@ -71,12 +70,11 @@ inline bool should_yield() {
     }
 }
 
-scheduling_group sched_group(const thread_context*);
-
 void yield();
 void switch_in(thread_context* to);
 void switch_out(thread_context* from);
 void init();
+bool is_context_switch_in_progress() noexcept;
 
 }
 }
